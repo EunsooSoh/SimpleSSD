@@ -22,6 +22,7 @@
 
 #include <cinttypes>
 #include <fstream>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -33,6 +34,9 @@
 namespace SimpleSSD {
 
 namespace FTL {
+
+// Seed of the random number generator used for filling and victim selection
+static const uint64_t RANDOM_SEED = 20260218;
 
 class PageMapping : public AbstractFTL {
  private:
@@ -50,6 +54,7 @@ class PageMapping : public AbstractFTL {
   uint32_t lastFreeBlockIndex;
 
   bool bReclaimMore;
+  std::mt19937_64 rng;  // Fixed seed: same initial state on every run
   bool bRandomTweak;
   uint32_t bitsetSize;
 

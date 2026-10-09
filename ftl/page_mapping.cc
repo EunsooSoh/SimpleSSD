@@ -37,7 +37,8 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
       conf(c),
       lastFreeBlock(param.pageCountToMaxPerf),
       lastFreeBlockIOMap(param.ioUnitInPage),
-      bReclaimMore(false) {
+      bReclaimMore(false),
+      rng(RANDOM_SEED) {
   blocks.reserve(param.totalPhysicalBlocks);
   table.reserve(param.totalLogicalBlocks * param.pagesInBlock);
 
@@ -166,8 +167,7 @@ bool PageMapping::initialize() {
   }
   else {
     // Random
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
+    auto &gen = rng;
     std::uniform_int_distribution<uint64_t> dist(0, nTotalLogicalPages - 1);
 
     for (uint64_t i = 0; i < nPagesToWarmup; i++) {
@@ -190,8 +190,7 @@ bool PageMapping::initialize() {
     // Random
     // We can successfully restrict range of LPN to create exact number of
     // invalid pages because we wrote in sequential mannor in step 1.
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
+    auto &gen = rng;
     std::uniform_int_distribution<uint64_t> dist(0, nPagesToWarmup - 1);
 
     for (uint64_t i = 0; i < nPagesToInvalidate; i++) {
@@ -202,8 +201,7 @@ bool PageMapping::initialize() {
   }
   else {
     // Random
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
+    auto &gen = rng;
     std::uniform_int_distribution<uint64_t> dist(0, nTotalLogicalPages - 1);
 
     for (uint64_t i = 0; i < nPagesToInvalidate; i++) {
@@ -504,8 +502,7 @@ void PageMapping::selectVictimBlock(std::vector<uint32_t> &list,
   if (policy == POLICY_RANDOM || policy == POLICY_DCHOICE) {
     uint64_t randomRange =
         policy == POLICY_RANDOM ? nBlocks : dChoiceParam * nBlocks;
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    auto &gen = rng;
     std::uniform_int_distribution<uint64_t> dist(0, weight.size() - 1);
     std::vector<std::pair<uint32_t, float>> selected;
 

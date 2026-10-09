@@ -17,6 +17,8 @@
  * Authors: Jie Zhang <jie@camelab.org>
  */
 
+#include <limits>
+
 #include "PALStatistics.h"
 #include "util/algorithm.hh"
 #include "util/old/SimpleSSD_types.h"

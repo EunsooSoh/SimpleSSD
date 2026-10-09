@@ -256,7 +256,14 @@ uint32_t Block::getNextWritePageIndex(uint32_t idx) {
 bool Block::getPageInfo(uint32_t pageIndex, std::vector<uint64_t> &lpn,
                         Bitset &map) {
   if (ioUnitInPage == 1 && map.size() == 1) {
-    map.set();
+    // Report only valid pages (otherwise GC copies every page of a victim)
+    if (pValidBits->test(pageIndex)) {
+      map.set();
+    }
+    else {
+      map.reset();
+    }
+
     lpn = std::vector<uint64_t>(1, pLPNs[pageIndex]);
   }
   else if (map.size() == ioUnitInPage) {

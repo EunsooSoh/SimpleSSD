@@ -58,11 +58,59 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
 
   memset(&stat, 0, sizeof(stat));
 
+  gcId = 0;
+  windowStartRequests = 0;
+  windowStartSeqRequests = 0;
+  chipEraseCount.assign(param.pageCountToMaxPerf, 0);
+
+  // Failure to open is not fatal: the log is only for analysis
+  gcEventLog.open("gc_events.csv");
+
+  if (gcEventLog.is_open()) {
+    gcEventLog << "tick,gc_id,block_idx,chip,valid_pages,erase_count,copied,"
+                  "window_seq_ratio"
+               << std::endl;
+  }
+
   bRandomTweak = conf.readBoolean(CONFIG_FTL, FTL_USE_RANDOM_IO_TWEAK);
   bitsetSize = bRandomTweak ? param.ioUnitInPage : 1;
 }
 
-PageMapping::~PageMapping() {}
+// Sequential ratio of host write requests since the previous GC
+double PageMapping::windowSeqRatio() {
+  uint64_t requests = hostWriteTracker.requests - windowStartRequests;
+
+  return requests ? (double)(hostWriteTracker.seqRequests -
+                             windowStartSeqRequests) /
+                        requests
+                  : 0.0;
+}
+
+PageMapping::~PageMapping() {
+  dumpBlockEraseCounts();
+}
+
+// Dump erase count of every block (used and free) to block_erase.csv
+void PageMapping::dumpBlockEraseCounts() {
+  std::ofstream out("block_erase.csv");
+
+  if (!out.is_open()) {
+    return;
+  }
+
+  out << "block_idx,chip,erase_count" << std::endl;
+
+  for (auto &iter : blocks) {
+    out << iter.first << "," << iter.first % param.pageCountToMaxPerf << ","
+        << iter.second.getEraseCount() << "\n";
+  }
+
+  for (auto &iter : freeBlocks) {
+    out << iter.getBlockIndex() << ","
+        << iter.getBlockIndex() % param.pageCountToMaxPerf << ","
+        << iter.getEraseCount() << "\n";
+  }
+}
 
 bool PageMapping::initialize() {
   uint64_t nPagesToWarmup;
@@ -515,6 +563,18 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
       panic("Invalid block");
     }
 
+    // Log victim before valid pages are moved
+    uint32_t validAtVictim = block->second.getValidPageCountRaw();
+
+    stat.gcVictims++;
+
+    if (validAtVictim == 0) {
+      stat.gcZeroValidVictims++;
+    }
+
+    uint32_t eraseCountAtVictim = block->second.getEraseCount();
+    uint64_t copiedBefore = stat.validPageCopies;
+
     // Copy valid pages to free block
     for (uint32_t pageIndex = 0; pageIndex < param.pagesInBlock; pageIndex++) {
       // Valid?
@@ -580,6 +640,15 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
       }
     }
 
+    if (gcEventLog.is_open()) {
+      gcEventLog << tick << "," << gcId << "," << block->first << ","
+                 << block->first % param.pageCountToMaxPerf << ","
+                 << validAtVictim << "," << eraseCountAtVictim << ","
+                 << stat.validPageCopies - copiedBefore << ","
+                 << windowSeqRatio()
+                 << "\n";
+    }
+
     // Erase block
     req.blockIndex = block->first;
     req.pageIndex = 0;
@@ -587,6 +656,10 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
 
     eraseRequests.push_back(req);
   }
+
+  gcId++;
+  windowStartRequests = hostWriteTracker.requests;
+  windowStartSeqRequests = hostWriteTracker.seqRequests;
 
   // Do actual I/O here
   // This handles PAL2 limitation (SIGSEGV, infinite loop, or so-on)
@@ -678,6 +751,11 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
   uint64_t beginAt;
   uint64_t finishedAt = tick;
   bool readBeforeWrite = false;
+
+  // Host write statistics (initialization is excluded)
+  if (sendToPAL) {
+    stat.hostWritePages += bRandomTweak ? req.ioFlag.count() : 1;
+  }
 
   if (mappingList != table.end()) {
     for (uint32_t idx = 0; idx < bitsetSize; idx++) {
@@ -855,6 +933,9 @@ void PageMapping::eraseInternal(PAL::Request &req, uint64_t &tick) {
     panic("There are valid pages in victim block");
   }
 
+  stat.eraseCount++;
+  chipEraseCount.at(req.blockIndex % param.pageCountToMaxPerf)++;
+
   // Erase block
   block->second.erase();
 
@@ -962,6 +1043,41 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.name = prefix + "page_mapping.wear_leveling";
   temp.desc = "Wear-leveling factor";
   list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.host.write_pages";
+  temp.desc = "Total host write pages (I/O units)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.host.seq_ratio";
+  temp.desc = "Ratio of host writes continuing the previous LPN";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.nand_write_pages";
+  temp.desc = "Host write pages + GC copied pages";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.waf";
+  temp.desc = "Write amplification factor";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.erase.count";
+  temp.desc = "Total erase count";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.gc.zero_valid_victims";
+  temp.desc = "Victim blocks reclaimed without valid page copy";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.gc.avg_valid_per_victim";
+  temp.desc = "Average valid pages (I/O units) per victim block";
+  list.push_back(temp);
+
+  for (uint32_t i = 0; i < chipEraseCount.size(); i++) {
+    temp.name = prefix + "page_mapping.erase.chip" + std::to_string(i);
+    temp.desc = "Erase count of blocks with index % chips == " +
+                std::to_string(i);
+    list.push_back(temp);
+  }
 }
 
 void PageMapping::getStatValues(std::vector<double> &values) {
@@ -970,10 +1086,30 @@ void PageMapping::getStatValues(std::vector<double> &values) {
   values.push_back(stat.validSuperPageCopies);
   values.push_back(stat.validPageCopies);
   values.push_back(calculateWearLeveling());
+  values.push_back(stat.hostWritePages);
+  values.push_back(hostWriteTracker.requests
+                       ? (double)hostWriteTracker.seqRequests /
+                             hostWriteTracker.requests
+                       : 0.0);
+  values.push_back(stat.hostWritePages + stat.validPageCopies);
+  values.push_back(stat.hostWritePages
+                       ? (double)(stat.hostWritePages + stat.validPageCopies) /
+                             stat.hostWritePages
+                       : 0.0);
+  values.push_back(stat.eraseCount);
+  values.push_back(stat.gcZeroValidVictims);
+  values.push_back(stat.gcVictims
+                       ? (double)stat.validPageCopies / stat.gcVictims
+                       : 0.0);
+
+  for (auto &iter : chipEraseCount) {
+    values.push_back(iter);
+  }
 }
 
 void PageMapping::resetStatValues() {
   memset(&stat, 0, sizeof(stat));
+  std::fill(chipEraseCount.begin(), chipEraseCount.end(), 0);
 }
 
 }  // namespace FTL

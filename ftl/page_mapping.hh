@@ -21,6 +21,7 @@
 #define __FTL_PAGE_MAPPING__
 
 #include <cinttypes>
+#include <fstream>
 #include <unordered_map>
 #include <vector>
 
@@ -57,7 +58,21 @@ class PageMapping : public AbstractFTL {
     uint64_t reclaimedBlocks;
     uint64_t validSuperPageCopies;
     uint64_t validPageCopies;
+    uint64_t hostWritePages;     // host writes in I/O units (excl. init)
+    uint64_t eraseCount;
+    uint64_t gcZeroValidVictims;  // victims reclaimed without any copy
+    uint64_t gcVictims;
   } stat;
+
+  // Logging for GC analysis (gc_events.csv, block_erase.csv)
+  std::ofstream gcEventLog;
+  uint64_t gcId;
+  uint64_t windowStartRequests;  // hostWriteTracker values at previous GC
+  uint64_t windowStartSeqRequests;
+  std::vector<uint64_t> chipEraseCount;
+
+  void dumpBlockEraseCounts();
+  double windowSeqRatio();
 
   float freeBlockRatio();
   uint32_t convertBlockIdx(uint32_t);

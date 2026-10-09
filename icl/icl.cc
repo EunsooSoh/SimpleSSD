@@ -104,6 +104,9 @@ void ICL::write(Request &req, uint64_t &tick) {
   reqInternal.reqID = req.reqID;
   reqInternal.offset = req.offset;
 
+  hostWriteTracker.record(req.range.slpn * logicalPageSize + req.offset,
+                          req.length);
+
   for (uint64_t i = 0; i < req.range.nlp; i++) {
     beginAt = tick;
 

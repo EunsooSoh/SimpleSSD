@@ -28,6 +28,21 @@ LPNRange::_LPNRange() : slpn(0), nlp(0) {}
 
 LPNRange::_LPNRange(uint64_t s, uint64_t n) : slpn(s), nlp(n) {}
 
+HostWriteTracker hostWriteTracker;
+
+HostWriteTracker::_HostWriteTracker()
+    : requests(0), seqRequests(0), lastEnd(UINT64_MAX) {}
+
+void HostWriteTracker::record(uint64_t start, uint64_t length) {
+  requests++;
+
+  if (start == lastEnd) {
+    seqRequests++;
+  }
+
+  lastEnd = start + length;
+}
+
 namespace HIL {
 
 Request::_Request()

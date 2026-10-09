@@ -37,6 +37,20 @@ typedef struct _LPNRange {
   _LPNRange(uint64_t, uint64_t);
 } LPNRange;
 
+// Sequentiality of host write requests (byte addresses), updated by ICL and
+// read by FTL statistics. A request is sequential if it starts where the
+// previous write request ended.
+typedef struct _HostWriteTracker {
+  uint64_t requests;
+  uint64_t seqRequests;
+  uint64_t lastEnd;
+
+  _HostWriteTracker();
+  void record(uint64_t, uint64_t);
+} HostWriteTracker;
+
+extern HostWriteTracker hostWriteTracker;
+
 namespace HIL {
 
 typedef struct _Request {

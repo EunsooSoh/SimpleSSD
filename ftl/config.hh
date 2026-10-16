@@ -45,10 +45,14 @@ typedef enum {
   /* N+K Mapping configuration*/
   FTL_NKMAP_N,
   FTL_NKMAP_K,
+
+  /* FAST mapping configuration */
+  FTL_FAST_RW_LOG_BLOCKS,
 } FTL_CONFIG;
 
 typedef enum {
   PAGE_MAPPING,
+  FAST_MAPPING,
 } MAPPING;
 
 typedef enum {
@@ -84,6 +88,7 @@ class Config : public BaseConfig {
   EVICT_POLICY evictPolicy;    //!< Default: POLICY_GREEDY
   uint64_t dChoiceParam;       //!< Default: 3
   bool randomIOTweak;          //!< Default: true
+  uint64_t fastRWLogBlocks;    //!< Default: 8 (FAST의 RW 로그 블록 수)
 
  public:
   Config();

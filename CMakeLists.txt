@@ -96,6 +96,7 @@ set(SRC_FTL_COMMON
 )
 set(SRC_FTL
   ftl/config.cc
+  ftl/fast.cc
   ftl/ftl.cc
   ftl/page_mapping.cc
 )

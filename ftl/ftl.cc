@@ -19,6 +19,7 @@
 
 #include "ftl/ftl.hh"
 
+#include "ftl/fast.hh"
 #include "ftl/page_mapping.hh"
 
 namespace SimpleSSD {
@@ -44,6 +45,11 @@ FTL::FTL(ConfigReader &c, DRAM::AbstractDRAM *d) : conf(c), pDRAM(d) {
     case PAGE_MAPPING:
       pFTL = new PageMapping(conf, param, pPAL, pDRAM);
       break;
+    case FAST_MAPPING:
+      pFTL = new FAST(conf, param, pPAL, pDRAM);
+      break;
+    default:
+      panic("ftl: 지원하지 않는 MappingMode입니다");
   }
 
   if (param.totalPhysicalBlocks <=

@@ -197,3 +197,11 @@ add_library(simplessd STATIC
   ${SRC_UTIL}
 )
 target_link_libraries(simplessd mcpat)
+
+# 테스트 빌드 옵션 (기본 OFF): cmake -DBUILD_TESTS=ON 후 make test_fast
+option(BUILD_TESTS "Build SimpleSSD unit tests." OFF)
+
+if (BUILD_TESTS)
+  add_executable(test_fast test/ftl/test_fast.cc)
+  target_link_libraries(test_fast simplessd)
+endif ()

@@ -20,6 +20,8 @@
 #include "ftl/fast.hh"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 
@@ -77,7 +79,12 @@ FAST::FAST(ConfigReader &c, Parameter &p, PAL::PAL *l, DRAM::AbstractDRAM *d)
   dataBlockMap.reserve(param.totalLogicalBlocks);
 }
 
-FAST::~FAST() {}
+FAST::~FAST() {
+#ifdef FAST_VERIFY_VICTIM
+  fprintf(stderr, "[FAST_VERIFY_VICTIM] policy=%u 검사한 victim 선택 %" PRIu64 "회, 모두 통과\n",
+          rwGCPolicy, verifiedVictims);
+#endif
+}
 
 bool FAST::initialize() {
   uint64_t nTotalLogicalPages;
@@ -772,11 +779,53 @@ std::list<uint32_t>::iterator FAST::selectRWVictim() {
   return best;
 }
 
+#ifdef FAST_VERIFY_VICTIM
+// 정책이 고른 victim이 정책 정의와 맞는지 검사한다 (빌드 옵션 -DFAST_VERIFY_VICTIM).
+// 블록의 유효 sector 수는 Block이 아니라 rwMap에서 따로 세어 대조한다.
+void FAST::verifyRWVictim(std::list<uint32_t>::iterator sel) {
+  std::unordered_map<uint32_t, uint32_t> validByMap;
+
+  for (auto &e : rwMap) {
+    validByMap[e.second.first]++;
+  }
+
+  for (auto pbn : rwLogs) {
+    if (blocks.at(pbn).getValidPageCountRaw() != validByMap[pbn]) {
+      panic("ftl: RW 로그 %u의 유효 sector 수 불일치 (블록 %u, rwMap %u)", pbn,
+            blocks.at(pbn).getValidPageCountRaw(), validByMap[pbn]);
+    }
+  }
+
+  auto expect = rwLogs.begin();
+
+  if (rwGCPolicy == 1) {
+    uint32_t minValid = validByMap[*expect];
+
+    for (auto iter = rwLogs.begin(); iter != rwLogs.end(); ++iter) {
+      if (validByMap[*iter] < minValid) {
+        minValid = validByMap[*iter];
+        expect = iter;
+      }
+    }
+  }
+
+  if (sel != expect) {
+    panic("ftl: victim 선택 오류: 선택 %u (유효 %u), 기대 %u (유효 %u)", *sel,
+          validByMap[*sel], *expect, validByMap[*expect]);
+  }
+
+  verifiedVictims++;
+}
+#endif
+
 // 정책이 고른 RW 로그 블록을 victim으로 비운다.
 // victim에 유효 sector를 가진 모든 논리 블록을 각각 full merge 한다.
 // 여러 논리 블록의 merge 요청을 하나의 batch로 모아 채널/chip 병렬성을 쓴다.
 void FAST::mergeRWVictim() {
   auto victimIter = selectRWVictim();
+#ifdef FAST_VERIFY_VICTIM
+  verifyRWVictim(victimIter);
+#endif
   uint32_t victim = *victimIter;
   std::vector<uint64_t> unique;
   std::vector<uint64_t> lpns;

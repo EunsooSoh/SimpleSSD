@@ -151,6 +151,10 @@ class FAST : public AbstractFTL {
   void mergeSW();
   void mergeLbn(uint64_t);
   std::list<uint32_t>::iterator selectRWVictim();
+#ifdef FAST_VERIFY_VICTIM
+  uint64_t verifiedVictims = 0;  // 검사를 통과한 victim 선택 횟수
+  void verifyRWVictim(std::list<uint32_t>::iterator);
+#endif
   void mergeRWVictim();
 
   void readInternal(Request &, uint64_t &);

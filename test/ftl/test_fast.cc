@@ -79,16 +79,43 @@ static void verify(FAST &f, Parameter &p, std::set<uint64_t> &model, const char 
     CHECK(std::find(f.rwLogs.begin(), f.rwLogs.end(), e.second.first) != f.rwLogs.end(), "[%s %d] rwMap points outside rw logs", when, step);
   }
   CHECK(f.rwLogs.size() <= f.maxRWLogs, "[%s %d] too many rw logs", when, step);
+
+  // victim 선택 검사: selectRWVictim()은 상태를 바꾸지 않으므로 매 단계 호출해 볼 수 있다.
+  // 블록의 유효 sector 수는 Block이 아니라 rwMap에서 따로 세어 서로 대조한다.
+  if (!f.rwLogs.empty()) {
+    std::map<uint32_t, uint32_t> validByMap;
+    for (auto &e : f.rwMap) validByMap[e.second.first]++;
+    for (auto pbn : f.rwLogs) {
+      CHECK(f.blocks.at(pbn).getValidPageCountRaw() == validByMap[pbn], "[%s %d] rw log %u valid count mismatch (block %u, rwMap %u)", when, step, pbn, f.blocks.at(pbn).getValidPageCountRaw(), validByMap[pbn]);
+    }
+    auto sel = f.selectRWVictim();
+    CHECK(sel != f.rwLogs.end(), "[%s %d] selectRWVictim returned end", when, step);
+    if (sel != f.rwLogs.end()) {
+      if (f.rwGCPolicy == 0) {
+        CHECK(sel == f.rwLogs.begin(), "[%s %d] FIFO did not pick the oldest rw log", when, step);
+      } else {
+        // greedy: 유효 sector 수가 최소이고, 최소가 여러 개면 가장 앞(오래된) 블록
+        uint32_t minValid = UINT32_MAX;
+        auto expect = f.rwLogs.begin();
+        for (auto it = f.rwLogs.begin(); it != f.rwLogs.end(); ++it) {
+          uint32_t v = validByMap[*it];
+          if (v < minValid) { minValid = v; expect = it; }
+        }
+        CHECK(sel == expect, "[%s %d] greedy picked %u (valid %u), expected %u (valid %u)", when, step, *sel, validByMap[*sel], *expect, minValid);
+      }
+    }
+  }
 }
 
-// 설정 파일을 읽어 FASTRWLogBlocks만 작은 값으로 바꾼 임시 설정 파일을 만든다
-// (RW 로그가 자주 가득 차서 merge 경로가 많이 실행되게 하기 위함)
-static std::string makeTestConfig(const char *path) {
+// 설정 파일을 읽어 FASTRWLogBlocks만 작은 값으로 바꾸고 FASTRWGCPolicy를 지정한
+// 임시 설정 파일을 만든다 (RW 로그가 자주 가득 차서 merge 경로가 많이 실행되게 하기 위함)
+static std::string makeTestConfig(const char *path, int policy) {
   std::ifstream in(path);
   std::string tmp = "test_fast.tmp.cfg";
   std::ofstream out(tmp);
   std::string line;
   bool replaced = false;
+  bool policyReplaced = false;
 
   if (!in.is_open()) {
     printf("설정 파일을 열 수 없습니다: %s\n", path);
@@ -100,12 +127,21 @@ static std::string makeTestConfig(const char *path) {
       line = "FASTRWLogBlocks = 3";
       replaced = true;
     }
+    else if (line.compare(0, 14, "FASTRWGCPolicy") == 0) {
+      line = "FASTRWGCPolicy = " + std::to_string(policy);
+      policyReplaced = true;
+    }
 
     out << line << "\n";
   }
 
   if (!replaced) {
     printf("설정 파일에 FASTRWLogBlocks가 없습니다\n");
+    exit(2);
+  }
+
+  if (!policyReplaced) {
+    printf("설정 파일에 FASTRWGCPolicy가 없습니다\n");
     exit(2);
   }
 
@@ -118,10 +154,6 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  std::string cfg = makeTestConfig(argv[1]);
-  ConfigReader conf;
-  conf.init(cfg);
-  std::remove(cfg.c_str());
   Parameter p;
   p.totalPhysicalBlocks = 60;
   p.totalLogicalBlocks = 30;
@@ -130,7 +162,13 @@ int main(int argc, char **argv) {
   p.ioUnitInPage = 4;
   p.pageCountToMaxPerf = 4;
 
+  // RW 로그 victim 정책(0: FIFO, 1: greedy) 두 가지를 모두 검사한다
+  for (int policy : {0, 1})
   for (int ioUnit : {4, 1}) {
+    std::string cfg = makeTestConfig(argv[1], policy);
+    ConfigReader conf;
+    conf.init(cfg);
+    std::remove(cfg.c_str());
     p.ioUnitInPage = ioUnit;
     FAST f(conf, p, nullptr, nullptr);
     f.bSendToPAL = false;
@@ -196,9 +234,9 @@ int main(int argc, char **argv) {
           for (uint32_t l = 0; l < p.ioUnitInPage; l++) model.erase(lp * p.ioUnitInPage + l);
         verify(f, p, model, "format", step++);
       }
-      if (failures) { printf("stopped at round %d (ioUnit %d)\n", round, ioUnit); return 1; }
+      if (failures) { printf("stopped at round %d (policy %d ioUnit %d)\n", round, policy, ioUnit); return 1; }
     }
-    printf("ioUnit %d OK: steps=%d switch=%" PRIu64 " partial=%" PRIu64 " full=%" PRIu64 " victims=%" PRIu64 "\n", ioUnit, step, f.stat.switchMerge, f.stat.partialMerge, f.stat.fullMerge, f.stat.rwVictims);
+    printf("policy %d ioUnit %d OK: steps=%d switch=%" PRIu64 " partial=%" PRIu64 " full=%" PRIu64 " victims=%" PRIu64 "\n", policy, ioUnit, step, f.stat.switchMerge, f.stat.partialMerge, f.stat.fullMerge, f.stat.rwVictims);
   }
   return failures ? 1 : 0;
 }

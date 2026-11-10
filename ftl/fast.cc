@@ -44,6 +44,12 @@ FAST::FAST(ConfigReader &c, Parameter &p, PAL::PAL *l, DRAM::AbstractDRAM *d)
     panic("ftl: FASTRWLogBlocks는 1 이상이어야 합니다");
   }
 
+  rwGCPolicy = conf.readUint(CONFIG_FTL, FTL_FAST_RW_GC_POLICY);
+
+  if (rwGCPolicy > 1) {
+    panic("ftl: FASTRWGCPolicy는 0(FIFO) 또는 1(greedy)이어야 합니다");
+  }
+
   // 데이터 블록 전체 + SW 로그 1개 + RW 로그 + merge용 여유 블록 2개가 필요하다
   if (param.totalPhysicalBlocks <
       param.totalLogicalBlocks + maxRWLogs + 1 + 2) {
@@ -742,11 +748,36 @@ void FAST::mergeLbn(uint64_t lbn) {
   stat.fullMerge++;
 }
 
-// RW 로그 중 가장 오래된 블록을 victim으로 골라 비운다.
+// RW 로그 중 비울 victim을 정책에 따라 고른다. SW 로그는 블록이 1개뿐이라
+// 고를 대상이 없으므로 이 정책은 RW 로그에만 적용된다.
+//  - 0 (FIFO): 가장 오래된 블록
+//  - 1 (greedy): 유효 sector가 가장 적은 블록. 같으면 더 오래된 블록을 고른다.
+//    유효 sector가 적을수록 merge로 옮길 sector가 적을 것이라는 기준이다.
+std::list<uint32_t>::iterator FAST::selectRWVictim() {
+  auto best = rwLogs.begin();
+
+  if (rwGCPolicy == 1) {
+    uint32_t bestValid = blocks.at(*best).getValidPageCountRaw();
+
+    for (auto iter = std::next(best); iter != rwLogs.end(); ++iter) {
+      uint32_t valid = blocks.at(*iter).getValidPageCountRaw();
+
+      if (valid < bestValid) {
+        best = iter;
+        bestValid = valid;
+      }
+    }
+  }
+
+  return best;
+}
+
+// 정책이 고른 RW 로그 블록을 victim으로 비운다.
 // victim에 유효 sector를 가진 모든 논리 블록을 각각 full merge 한다.
 // 여러 논리 블록의 merge 요청을 하나의 batch로 모아 채널/chip 병렬성을 쓴다.
 void FAST::mergeRWVictim() {
-  uint32_t victim = rwLogs.front();
+  auto victimIter = selectRWVictim();
+  uint32_t victim = *victimIter;
   std::vector<uint64_t> unique;
   std::vector<uint64_t> lpns;
   Bitset bit(param.ioUnitInPage);
@@ -773,7 +804,7 @@ void FAST::mergeRWVictim() {
   }
 
   // 이제 victim에는 유효 sector가 없다
-  rwLogs.pop_front();
+  rwLogs.erase(victimIter);
   eraseBlock(victim);
 
   stat.rwVictims++;

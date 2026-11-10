@@ -48,6 +48,7 @@ typedef enum {
 
   /* FAST mapping configuration */
   FTL_FAST_RW_LOG_BLOCKS,
+  FTL_FAST_RW_GC_POLICY,
 } FTL_CONFIG;
 
 typedef enum {
@@ -89,6 +90,7 @@ class Config : public BaseConfig {
   uint64_t dChoiceParam;       //!< Default: 3
   bool randomIOTweak;          //!< Default: true
   uint64_t fastRWLogBlocks;    //!< Default: 8 (FAST의 RW 로그 블록 수)
+  uint64_t fastRWGCPolicy;     //!< Default: 0 (0: FIFO, 1: greedy)
 
  public:
   Config();

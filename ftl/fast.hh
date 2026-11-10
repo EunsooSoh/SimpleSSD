@@ -75,6 +75,7 @@ class FAST : public AbstractFTL {
   // RW(랜덤 쓰기) 로그 블록: 가장 앞이 가장 오래된 블록(victim 후보)
   std::list<uint32_t> rwLogs;
   uint32_t maxRWLogs;
+  uint32_t rwGCPolicy;  // RW 로그 victim 선택 방식 (0: FIFO, 1: greedy)
 
   // RW 로그의 섹터 매핑 테이블 (lpn * lane 수 + lane -> (블록, 페이지))
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> rwMap;
@@ -149,6 +150,11 @@ class FAST : public AbstractFTL {
   void appendSW(uint64_t, uint32_t);
   void mergeSW();
   void mergeLbn(uint64_t);
+  std::list<uint32_t>::iterator selectRWVictim();
+#ifdef FAST_VERIFY_VICTIM
+  uint64_t verifiedVictims = 0;  // 검사를 통과한 victim 선택 횟수
+  void verifyRWVictim(std::list<uint32_t>::iterator);
+#endif
   void mergeRWVictim();
 
   void readInternal(Request &, uint64_t &);

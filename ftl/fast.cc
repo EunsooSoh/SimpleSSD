@@ -52,6 +52,14 @@ FAST::FAST(ConfigReader &c, Parameter &p, PAL::PAL *l, DRAM::AbstractDRAM *d)
     panic("ftl: FASTRWGCPolicy는 0(FIFO) 또는 1(greedy)이어야 합니다");
   }
 
+  rwChip = 0;
+  bufferedInReq = 0;
+  useWriteBuffer = conf.readUint(CONFIG_FTL, FTL_FAST_WRITE_BUFFER) == 1;
+
+  // 열린 RW 로그 슬롯은 chip 수와 RW 로그 한도 중 작은 값만큼 둔다
+  nOpenSlots = MIN(param.pageCountToMaxPerf, maxRWLogs);
+  openRW.assign(nOpenSlots, -1);
+
   // 데이터 블록 전체 + SW 로그 1개 + RW 로그 + merge용 여유 블록 2개가 필요하다
   if (param.totalPhysicalBlocks <
       param.totalLogicalBlocks + maxRWLogs + 1 + 2) {
@@ -75,6 +83,9 @@ FAST::FAST(ConfigReader &c, Parameter &p, PAL::PAL *l, DRAM::AbstractDRAM *d)
   batch.doneTick = 0;
 
   chipEraseCount.assign(param.pageCountToMaxPerf, 0);
+  chipWrite.assign(param.pageCountToMaxPerf, 0);
+  chanWrite.assign(param.ioUnitInPage, 0);
+  chanErase.assign(param.ioUnitInPage, 0);
 
   dataBlockMap.reserve(param.totalLogicalBlocks);
 }
@@ -167,8 +178,7 @@ bool FAST::initialize() {
   bSendToPAL = true;
 
   // 초기화 과정의 통계는 버린다
-  memset(&stat, 0, sizeof(stat));
-  std::fill(chipEraseCount.begin(), chipEraseCount.end(), 0);
+  resetStatValues();
 
   debugprint(LOG_FTL_FAST, "Mapped logical pages: %zu", mappedLanes.size());
   debugprint(LOG_FTL_FAST, "Initialization finished");
@@ -234,12 +244,25 @@ void FAST::format(LPNRange &range, uint64_t &tick) {
     for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
       uint32_t pbn;
       uint32_t page;
+      uint64_t key = lpn * param.ioUnitInPage + lane;
+      bool mapped = false;
 
       if (findLatest(lpn, lane, pbn, page)) {
         invalidateLatest(lpn, lane);
-        unmapSector(lpn);
 
         lbns.push_back(lpn / param.pagesInBlock);
+
+        mapped = true;
+      }
+
+      if (inBuffer(key)) {
+        dropFromBuffer(key);
+
+        mapped = true;
+      }
+
+      if (mapped) {
+        unmapSector(lpn);
       }
     }
   }
@@ -295,6 +318,15 @@ Status *FAST::getStatus(uint64_t lpnBegin, uint64_t lpnEnd) {
 // 비어 있는 블록 중 하나를 꺼내 사용 중 블록으로 옮긴다.
 // 병렬성을 위해 chip(blockIdx % pageCountToMaxPerf)을 돌아가며 고른다.
 uint32_t FAST::getFreeBlock() {
+  uint32_t chip = allocChip;
+
+  allocChip = (allocChip + 1) % param.pageCountToMaxPerf;
+
+  return getFreeBlockOnChip(chip);
+}
+
+// 지정한 chip의 빈 블록을 꺼낸다. 그 chip에 빈 블록이 없으면 맨 앞 블록을 쓴다.
+uint32_t FAST::getFreeBlockOnChip(uint32_t chip) {
   uint32_t blockIndex = 0;
 
   // 지연된 erase가 있으면 먼저 반영해서 여유 블록을 확보한다
@@ -305,10 +337,6 @@ uint32_t FAST::getFreeBlock() {
   if (nFreeBlocks == 0) {
     panic("ftl: No free block left");
   }
-
-  uint32_t chip = allocChip;
-
-  allocChip = (allocChip + 1) % param.pageCountToMaxPerf;
 
   auto iter = freeBlocks.begin();
 
@@ -388,6 +416,11 @@ void FAST::eraseBlockNow(uint32_t pbn, uint64_t &tick) {
 
     stat.eraseCount++;
     chipEraseCount.at(pbn % param.pageCountToMaxPerf)++;
+
+    // 슈퍼블록 erase는 채널마다 물리 블록 1개씩을 지운다
+    for (auto &iter : chanErase) {
+      iter++;
+    }
 
     tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::ERASE_INTERNAL);
   }
@@ -515,20 +548,25 @@ bool FAST::isValid(uint32_t pbn, uint32_t page, uint32_t lane) {
   return scratchBits.test(lane);
 }
 
-// (lpn, lane)의 최신 버전 위치를 찾는다: RW 로그 -> SW 로그 -> 데이터 블록 순
+// (lpn, lane)의 NAND 최신 버전 위치를 찾는다: RW 로그 -> SW 로그 -> 데이터 블록 순.
+// physLane은 실제로 놓인 lane이다 (데이터 블록/SW 로그에서는 항상 lane과 같다).
+// 쓰기 버퍼에 있는 버전은 여기서 찾지 않는다 (inBuffer로 따로 확인).
 bool FAST::findLatest(uint64_t lpn, uint32_t lane, uint32_t &pbn,
-                      uint32_t &page) {
+                      uint32_t &page, uint32_t &physLane) {
   uint64_t lbn = lpn / param.pagesInBlock;
   uint32_t offset = lpn % param.pagesInBlock;
 
   auto rw = rwMap.find(lpn * param.ioUnitInPage + lane);
 
   if (rw != rwMap.end()) {
-    pbn = rw->second.first;
-    page = rw->second.second;
+    pbn = rw->second.pbn;
+    page = rw->second.page;
+    physLane = rw->second.lane;
 
     return true;
   }
+
+  physLane = lane;
 
   if (sw.valid && sw.lbn == lbn && offset < swNext[lane] &&
       isValid(sw.pbn, offset, lane)) {
@@ -550,20 +588,29 @@ bool FAST::findLatest(uint64_t lpn, uint32_t lane, uint32_t &pbn,
   return false;
 }
 
+bool FAST::findLatest(uint64_t lpn, uint32_t lane, uint32_t &pbn,
+                      uint32_t &page) {
+  uint32_t physLane;
+
+  return findLatest(lpn, lane, pbn, page, physLane);
+}
+
 // (lpn, lane)의 현재 최신 버전을 무효화하고 RW 섹터 맵에서도 지운다
 void FAST::invalidateLatest(uint64_t lpn, uint32_t lane) {
   uint32_t pbn;
   uint32_t page;
+  uint32_t physLane;
 
-  if (findLatest(lpn, lane, pbn, page)) {
-    blocks.at(pbn).invalidate(page, lane);
+  if (findLatest(lpn, lane, pbn, page, physLane)) {
+    blocks.at(pbn).invalidate(page, physLane);
 
     rwMap.erase(lpn * param.ioUnitInPage + lane);
   }
 }
 
-// sector 하나를 블록의 (page, lane) 칸에 쓴다
-void FAST::writeSector(uint32_t pbn, uint32_t page, uint64_t lpn,
+// sector 하나를 블록의 (page, lane) 칸에 쓴다. lane은 실제로 쓸 lane이다.
+// value는 칸에 저장할 값으로, 데이터 블록/SW 로그는 lpn, RW 로그는 sector 키다.
+void FAST::writeSector(uint32_t pbn, uint32_t page, uint64_t value,
                        uint32_t lane) {
   auto block = blocks.find(pbn);
 
@@ -571,25 +618,29 @@ void FAST::writeSector(uint32_t pbn, uint32_t page, uint64_t lpn,
     panic("ftl: 사용 중이지 않은 블록에 쓰기를 시도했습니다");
   }
 
-  block->second.write(page, lpn, lane, batch.beginTick);
+  block->second.write(page, value, lane, batch.beginTick);
 
   if (bSendToPAL) {
     queueOp(batch.writes, batch.writeIndex, pbn, page, lane);
 
     stat.nandWritePages++;
+    chanWrite.at(lane)++;
+    chipWrite.at(pbn % param.pageCountToMaxPerf)++;
   }
 }
 
-// merge 중 유효 sector를 다른 블록으로 옮긴다 (읽기 + 쓰기 + 원본 무효화)
+// merge 중 유효 sector를 다른 블록으로 옮긴다 (읽기 + 쓰기 + 원본 무효화).
+// 원본은 실제 lane(srcLane)에서 읽고, 대상(데이터 블록/SW 로그)에는 논리 lane에 쓴다.
 void FAST::copySector(uint64_t lpn, uint32_t lane, uint32_t srcBlock,
-                      uint32_t srcPage, uint32_t dstBlock, uint32_t dstPage) {
+                      uint32_t srcPage, uint32_t srcLane, uint32_t dstBlock,
+                      uint32_t dstPage) {
   if (bSendToPAL) {
-    queueOp(batch.reads, batch.readIndex, srcBlock, srcPage, lane);
+    queueOp(batch.reads, batch.readIndex, srcBlock, srcPage, srcLane);
 
     stat.sectorCopies++;
   }
 
-  blocks.at(srcBlock).invalidate(srcPage, lane);
+  blocks.at(srcBlock).invalidate(srcPage, srcLane);
 
   rwMap.erase(lpn * param.ioUnitInPage + lane);
 
@@ -628,6 +679,8 @@ void FAST::startSW(uint64_t lbn) {
 
 // SW 로그의 해당 lane에 이어서 쓴다 (offset == swNext[lane]이어야 한다)
 void FAST::appendSW(uint64_t lpn, uint32_t lane) {
+  // 버퍼에 있던 이전 버전은 이 쓰기로 대체된다
+  dropFromBuffer(lpn * param.ioUnitInPage + lane);
   invalidateLatest(lpn, lane);
   writeSector(sw.pbn, swNext[lane], lpn, lane);
 
@@ -677,9 +730,12 @@ void FAST::mergeSW() {
           uint64_t lpn = lbn * param.pagesInBlock + o;
           uint32_t pbn;
           uint32_t page;
+          uint32_t physLane;
 
-          if (findLatest(lpn, lane, pbn, page) && hasOld && pbn == oldPbn) {
-            copySector(lpn, lane, pbn, page, sw.pbn, o);
+          // 기존 데이터 블록에 있는 칸만 대상이므로 physLane은 lane과 같다
+          if (findLatest(lpn, lane, pbn, page, physLane) && hasOld &&
+              pbn == oldPbn) {
+            copySector(lpn, lane, pbn, page, physLane, sw.pbn, o);
           }
         }
       }
@@ -719,9 +775,10 @@ void FAST::mergeLbn(uint64_t lbn) {
     for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
       uint32_t pbn;
       uint32_t page;
+      uint32_t physLane;
 
-      if (findLatest(lpn, lane, pbn, page)) {
-        copySector(lpn, lane, pbn, page, newPbn, o);
+      if (findLatest(lpn, lane, pbn, page, physLane)) {
+        copySector(lpn, lane, pbn, page, physLane, newPbn, o);
 
         copied++;
       }
@@ -760,19 +817,26 @@ void FAST::mergeLbn(uint64_t lbn) {
 //  - 0 (FIFO): 가장 오래된 블록
 //  - 1 (greedy): 유효 sector가 가장 적은 블록. 같으면 더 오래된 블록을 고른다.
 //    유효 sector가 적을수록 merge로 옮길 sector가 적을 것이라는 기준이다.
+// 쓰기 버퍼를 쓰면 지금 채우고 있는(열린) RW 로그는 후보에서 뺀다. 그래서 victim은
+// 모든 채널이 다 찬 RW 로그 중에서만 고른다.
 std::list<uint32_t>::iterator FAST::selectRWVictim() {
-  auto best = rwLogs.begin();
+  auto best = rwLogs.end();
+  uint32_t bestValid = 0;
 
-  if (rwGCPolicy == 1) {
-    uint32_t bestValid = blocks.at(*best).getValidPageCountRaw();
+  for (auto iter = rwLogs.begin(); iter != rwLogs.end(); ++iter) {
+    if (isOpenRW(*iter)) {
+      continue;
+    }
 
-    for (auto iter = std::next(best); iter != rwLogs.end(); ++iter) {
-      uint32_t valid = blocks.at(*iter).getValidPageCountRaw();
+    if (rwGCPolicy == 0) {
+      return iter;
+    }
 
-      if (valid < bestValid) {
-        best = iter;
-        bestValid = valid;
-      }
+    uint32_t valid = blocks.at(*iter).getValidPageCountRaw();
+
+    if (best == rwLogs.end() || valid < bestValid) {
+      best = iter;
+      bestValid = valid;
     }
   }
 
@@ -786,7 +850,7 @@ void FAST::verifyRWVictim(std::list<uint32_t>::iterator sel) {
   std::unordered_map<uint32_t, uint32_t> validByMap;
 
   for (auto &e : rwMap) {
-    validByMap[e.second.first]++;
+    validByMap[e.second.pbn]++;
   }
 
   for (auto pbn : rwLogs) {
@@ -796,17 +860,27 @@ void FAST::verifyRWVictim(std::list<uint32_t>::iterator sel) {
     }
   }
 
-  auto expect = rwLogs.begin();
+  // 열린 RW 로그를 뺀 블록 중에서 정책 정의대로 고른 결과를 따로 구한다
+  auto expect = rwLogs.end();
 
-  if (rwGCPolicy == 1) {
-    uint32_t minValid = validByMap[*expect];
-
-    for (auto iter = rwLogs.begin(); iter != rwLogs.end(); ++iter) {
-      if (validByMap[*iter] < minValid) {
-        minValid = validByMap[*iter];
-        expect = iter;
-      }
+  for (auto iter = rwLogs.begin(); iter != rwLogs.end(); ++iter) {
+    if (isOpenRW(*iter)) {
+      continue;
     }
+
+    if (expect == rwLogs.end() ||
+        (rwGCPolicy == 1 && validByMap[*iter] < validByMap[*expect])) {
+      expect = iter;
+    }
+  }
+
+  if (expect == rwLogs.end() || sel == rwLogs.end()) {
+    panic("ftl: victim 후보가 없습니다");
+  }
+
+  // 쓰기 버퍼 모드에서는 victim이 모든 lane에서 꽉 찬 블록이어야 한다
+  if (useWriteBuffer && !isRWFull(*sel)) {
+    panic("ftl: 다 차지 않은 RW 로그 %u를 victim으로 골랐습니다", *sel);
   }
 
   if (sel != expect) {
@@ -826,6 +900,10 @@ void FAST::mergeRWVictim() {
 #ifdef FAST_VERIFY_VICTIM
   verifyRWVictim(victimIter);
 #endif
+  if (victimIter == rwLogs.end()) {
+    panic("ftl: RW 로그 victim 후보가 없습니다");
+  }
+
   uint32_t victim = *victimIter;
   std::vector<uint64_t> unique;
   std::vector<uint64_t> lpns;
@@ -838,7 +916,9 @@ void FAST::mergeRWVictim() {
     if (block.getPageInfo(page, lpns, bit)) {
       for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
         if (bit.test(lane)) {
-          uint64_t lbn = lpns.at(lane) / param.pagesInBlock;
+          // RW 로그 칸에는 sector 키(lpn * lane 수 + 논리 lane)가 저장되어 있다
+          uint64_t lbn =
+              lpns.at(lane) / param.ioUnitInPage / param.pagesInBlock;
 
           if (std::find(unique.begin(), unique.end(), lbn) == unique.end()) {
             unique.push_back(lbn);
@@ -893,11 +973,195 @@ void FAST::writeToRW(uint64_t lpn, uint32_t lane) {
   }
 
   uint32_t page = blocks.at(target).getNextWritePageIndex(lane);
+  uint64_t key = lpn * param.ioUnitInPage + lane;
 
   invalidateLatest(lpn, lane);
-  writeSector(target, page, lpn, lane);
+  writeSector(target, page, key, lane);
 
-  rwMap[lpn * param.ioUnitInPage + lane] = {target, page};
+  rwMap[key] = {target, page, lane};
+}
+
+// RW 로그로 가는 쓰기: 쓰기 버퍼를 쓰면 버퍼에 넣고, 아니면 바로 RW 로그에 쓴다
+void FAST::writeRW(uint64_t lpn, uint32_t lane) {
+  if (useWriteBuffer) {
+    bufferSector(lpn, lane);
+  }
+  else {
+    writeToRW(lpn, lane);
+  }
+}
+
+/* --------------------------- 쓰기 버퍼 --------------------------- */
+
+bool FAST::inBuffer(uint64_t key) {
+  return wbufIndex.count(key) > 0;
+}
+
+// 지금 어떤 슬롯에서 채우고 있는 RW 로그인지 확인한다
+bool FAST::isOpenRW(uint32_t pbn) {
+  for (auto iter : openRW) {
+    if (iter == (int64_t)pbn) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// 모든 lane의 쓰기 포인터가 블록 끝에 도달했는지 확인한다
+bool FAST::isRWFull(uint32_t pbn) {
+  auto &block = blocks.at(pbn);
+
+  for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
+    if (block.getNextWritePageIndex(lane) < param.pagesInBlock) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// 업데이트 쓰기를 버퍼에 넣는다. 같은 sector가 이미 있으면 덮어쓰기만 하고
+// NAND에는 쓰지 않는다. 버퍼가 lane 수만큼 차면 슈퍼페이지 1개로 내보낸다.
+void FAST::bufferSector(uint64_t lpn, uint32_t lane) {
+  uint64_t key = lpn * param.ioUnitInPage + lane;
+
+  if (inBuffer(key)) {
+    if (bSendToPAL) {
+      stat.bufferAbsorbed++;
+    }
+
+    return;
+  }
+
+  // 최신 버전이 버퍼로 옮겨졌으므로 NAND의 이전 버전은 지금 무효화한다.
+  // 그래야 버퍼에 있는 동안 merge가 낡은 버전을 옮기지 않는다.
+  invalidateLatest(lpn, lane);
+
+  wbufIndex.emplace(key, wbuf.size());
+  wbuf.push_back(key);
+
+  bufferedInReq++;
+
+  if (wbuf.size() >= param.ioUnitInPage) {
+    flushWriteBuffer();
+  }
+}
+
+// 버퍼에서 sector를 뺀다 (더 새 버전이 다른 곳에 쓰였거나 trim/format된 경우).
+// 순서는 중요하지 않으므로 마지막 항목을 빈자리로 옮긴다.
+void FAST::dropFromBuffer(uint64_t key) {
+  auto iter = wbufIndex.find(key);
+
+  if (iter == wbufIndex.end()) {
+    return;
+  }
+
+  size_t pos = iter->second;
+  uint64_t last = wbuf.back();
+
+  wbuf[pos] = last;
+  wbufIndex[last] = pos;
+
+  wbuf.pop_back();
+  wbufIndex.erase(key);
+}
+
+// 슬롯의 열린 RW 로그를 돌려준다. 없거나 모든 lane이 다 찼으면 닫고 새 블록을
+// 연다. 이때 RW 로그가 한도만큼 있으면 다 찬 RW 로그 중 victim을 merge/erase 한다.
+uint32_t FAST::ensureOpenRW(uint32_t slot) {
+  int64_t cur = openRW.at(slot);
+
+  if (cur >= 0 && !isRWFull((uint32_t)cur)) {
+    return (uint32_t)cur;
+  }
+
+  // 다 찬 블록은 닫아서 victim 후보가 되게 한다
+  openRW.at(slot) = -1;
+
+  if (rwLogs.size() >= maxRWLogs) {
+    mergeRWVictim();
+  }
+
+  uint32_t pbn = getFreeBlockOnChip(slot % param.pageCountToMaxPerf);
+
+  rwLogs.push_back(pbn);
+  openRW.at(slot) = (int64_t)pbn;
+
+  return pbn;
+}
+
+// 버퍼의 sector를 지금 슬롯의 RW 로그에 쓴다. sector마다 쓰기 포인터가 가장 낮은
+// lane을 고르므로, 버퍼가 꽉 찼을 때는 같은 페이지의 모든 lane(채널)에 한 번에
+// 쓰이고 queueOp가 이를 NAND 요청 1개로 묶는다.
+void FAST::flushWriteBuffer() {
+  if (wbuf.empty()) {
+    return;
+  }
+
+  std::vector<uint64_t> keys;
+
+  // merge 중에도 버퍼 상태가 일관되도록 먼저 비운다
+  keys.swap(wbuf);
+  wbufIndex.clear();
+
+  uint32_t slot = rwChip;
+
+  rwChip = (rwChip + 1) % nOpenSlots;
+
+  // 이번 flush가 만든 NAND 쓰기 요청 (같은 블록/페이지의 lane은 한 요청으로 묶인다)
+  std::vector<PageOp> flushOps;
+
+  for (auto key : keys) {
+    uint32_t target = ensureOpenRW(slot);
+    auto &block = blocks.at(target);
+    uint32_t physLane = 0;
+    uint32_t page = param.pagesInBlock;
+
+    for (uint32_t l = 0; l < param.ioUnitInPage; l++) {
+      uint32_t next = block.getNextWritePageIndex(l);
+
+      if (next < page) {
+        page = next;
+        physLane = l;
+      }
+    }
+
+    // NAND의 이전 버전은 버퍼에 넣을 때 이미 무효화했다
+    writeSector(target, page, key, physLane);
+
+    rwMap[key] = {target, page, physLane};
+
+    if (flushOps.empty() || flushOps.back().pbn != target ||
+        flushOps.back().page != page) {
+      PageOp op = {target, page, Bitset(param.ioUnitInPage)};
+
+      op.flag.reset();
+      flushOps.push_back(op);
+    }
+
+    flushOps.back().flag.set(physLane);
+  }
+
+  if (bSendToPAL) {
+    stat.bufferFlushes++;
+    stat.bufferWriteOps += flushOps.size();
+
+    // 확인용 로그: lane 비트가 모두 1이면 슈퍼페이지 1개로 모든 채널에 쓴 것이다.
+    // chip은 블록 번호 % chip 수이며, 슬롯과 다르면 그 chip에 빈 블록이 없었던 것이다.
+    for (auto &op : flushOps) {
+      std::string lanes;
+
+      for (uint32_t l = 0; l < param.ioUnitInPage; l++) {
+        lanes += op.flag.test(l) ? '1' : '0';
+      }
+
+      debugprint(LOG_FTL_FAST,
+                 "FLUSH | slot %u | chip %u | block %u | page %u | lanes %s",
+                 slot, op.pbn % param.pageCountToMaxPerf, op.pbn, op.page,
+                 lanes.c_str());
+    }
+  }
 }
 
 // 데이터 블록에서 충돌이 난 sector를 로그 블록으로 보낸다 (논문 Algorithm 2)
@@ -923,11 +1187,11 @@ void FAST::writeToLog(uint64_t lpn, uint32_t lane) {
     else {
       // 순차성이 깨졌으므로 SW를 합치고 이번 쓰기는 RW 로그로 보낸다
       mergeSW();
-      writeToRW(lpn, lane);
+      writeRW(lpn, lane);
     }
   }
   else {
-    writeToRW(lpn, lane);
+    writeRW(lpn, lane);
   }
 }
 
@@ -941,19 +1205,42 @@ void FAST::readInternal(Request &req, uint64_t &tick) {
   uint64_t finishedAt = tick;
   uint32_t pbn;
   uint32_t page;
+  uint32_t physLane;
+  uint32_t buffered = 0;
 
   // 매핑 테이블(DRAM) 조회
   pDRAM->read(&dataBlockMap, 8, beginAt);
 
   for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
-    if (req.ioFlag.test(lane) && findLatest(req.lpn, lane, pbn, page)) {
-      blocks.at(pbn).read(page, lane, beginAt);
+    if (!req.ioFlag.test(lane)) {
+      continue;
+    }
 
-      queueOp(ops, index, pbn, page, lane);
+    // 쓰기 버퍼에 있는 최신 버전은 DRAM에서 읽는다
+    if (inBuffer(req.lpn * param.ioUnitInPage + lane)) {
+      buffered++;
+    }
+    else if (findLatest(req.lpn, lane, pbn, page, physLane)) {
+      blocks.at(pbn).read(page, physLane, beginAt);
+
+      queueOp(ops, index, pbn, page, physLane);
     }
   }
 
+  if (buffered > 0) {
+    uint64_t t = beginAt;
+
+    pDRAM->read(&wbuf, (uint64_t)buffered * (param.pageSize / param.ioUnitInPage),
+                t);
+
+    finishedAt = MAX(finishedAt, t);
+  }
+
   if (ops.empty()) {
+    if (buffered > 0) {
+      tick = finishedAt;
+    }
+
     return;
   }
 
@@ -992,6 +1279,8 @@ void FAST::writeInternal(Request &req, uint64_t &tick) {
 
   beginBatch(tick);
 
+  bufferedInReq = 0;
+
   // 요청에 포함된 lane을 sector 단위로 하나씩 처리한다.
   // lane마다 쓰기 포인터가 독립이므로 같은 페이지의 다른 lane은 충돌이 아니다.
   for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
@@ -1004,7 +1293,8 @@ void FAST::writeInternal(Request &req, uint64_t &tick) {
     uint32_t dbn;
     bool collision = false;
 
-    if (!findLatest(lpn, lane, pbn, page)) {
+    if (!findLatest(lpn, lane, pbn, page) &&
+        !inBuffer(lpn * param.ioUnitInPage + lane)) {
       mapSector(lpn);
     }
 
@@ -1024,6 +1314,7 @@ void FAST::writeInternal(Request &req, uint64_t &tick) {
     }
 
     if (!collision) {
+      dropFromBuffer(lpn * param.ioUnitInPage + lane);
       invalidateLatest(lpn, lane);
       writeSector(dbn, offset, lpn, lane);
     }
@@ -1032,10 +1323,20 @@ void FAST::writeInternal(Request &req, uint64_t &tick) {
     }
   }
 
+  // 버퍼에 넣은 sector는 DRAM 쓰기 지연만 받는다
+  uint64_t bufferDone = tick;
+
+  if (bSendToPAL && bufferedInReq > 0) {
+    pDRAM->write(&wbuf,
+                 (uint64_t)bufferedInReq * (param.pageSize / param.ioUnitInPage),
+                 bufferDone);
+  }
+
   flushBatch();
 
   if (bSendToPAL) {
-    tick = batch.doneTick;
+    // 이번 요청이 버퍼를 flush했으면 NAND(와 GC)가 끝날 때까지 기다린다
+    tick = MAX(batch.doneTick, bufferDone);
     tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::WRITE_INTERNAL);
   }
 }
@@ -1047,8 +1348,22 @@ void FAST::trimInternal(Request &req, uint64_t &tick) {
 
   // trim은 요청의 ioFlag와 관계없이 lpn의 모든 lane을 지운다
   for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
+    uint64_t key = req.lpn * param.ioUnitInPage + lane;
+    bool mapped = false;
+
     if (findLatest(req.lpn, lane, pbn, page)) {
       invalidateLatest(req.lpn, lane);
+
+      mapped = true;
+    }
+
+    if (inBuffer(key)) {
+      dropFromBuffer(key);
+
+      mapped = true;
+    }
+
+    if (mapped) {
       unmapSector(req.lpn);
 
       trimmed = true;
@@ -1147,6 +1462,39 @@ void FAST::getStatList(std::vector<Stats> &list, std::string prefix) {
         "Erase count of blocks with index % chips == " + std::to_string(i);
     list.push_back(temp);
   }
+
+  // 아래 채널 통계는 lane = 채널(SuperblockSize = C)이라고 보고 센다
+  for (uint32_t i = 0; i < chanErase.size(); i++) {
+    temp.name = prefix + "fast.erase.channel" + std::to_string(i);
+    temp.desc = "Erase count of physical blocks in channel " + std::to_string(i);
+    list.push_back(temp);
+  }
+
+  for (uint32_t i = 0; i < chanWrite.size(); i++) {
+    temp.name = prefix + "fast.write.channel" + std::to_string(i);
+    temp.desc = "NAND write count (I/O units) in channel " + std::to_string(i);
+    list.push_back(temp);
+  }
+
+  for (uint32_t i = 0; i < chipWrite.size(); i++) {
+    temp.name = prefix + "fast.write.chip" + std::to_string(i);
+    temp.desc = "NAND write count (I/O units) of blocks with index % chips == " +
+                std::to_string(i);
+    list.push_back(temp);
+  }
+
+  temp.name = prefix + "fast.buffer.flushes";
+  temp.desc = "Total RW write buffer flush count";
+  list.push_back(temp);
+
+  temp.name = prefix + "fast.buffer.absorbed";
+  temp.desc = "Total sectors overwritten in RW write buffer (not programmed)";
+  list.push_back(temp);
+
+  temp.name = prefix + "fast.buffer.write_ops";
+  temp.desc = "NAND write requests issued by buffer flush (== flushes if each "
+              "flush is one superpage)";
+  list.push_back(temp);
 }
 
 void FAST::getStatValues(std::vector<double> &values) {
@@ -1166,11 +1514,30 @@ void FAST::getStatValues(std::vector<double> &values) {
   for (auto &iter : chipEraseCount) {
     values.push_back(iter);
   }
+
+  for (auto &iter : chanErase) {
+    values.push_back(iter);
+  }
+
+  for (auto &iter : chanWrite) {
+    values.push_back(iter);
+  }
+
+  for (auto &iter : chipWrite) {
+    values.push_back(iter);
+  }
+
+  values.push_back(stat.bufferFlushes);
+  values.push_back(stat.bufferAbsorbed);
+  values.push_back(stat.bufferWriteOps);
 }
 
 void FAST::resetStatValues() {
   memset(&stat, 0, sizeof(stat));
   std::fill(chipEraseCount.begin(), chipEraseCount.end(), 0);
+  std::fill(chipWrite.begin(), chipWrite.end(), 0);
+  std::fill(chanWrite.begin(), chanWrite.end(), 0);
+  std::fill(chanErase.begin(), chanErase.end(), 0);
 }
 
 }  // namespace FTL

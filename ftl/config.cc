@@ -40,6 +40,7 @@ const char NAME_GC_D_CHOICE_PARAM[] = "DChoiceParam";
 const char NAME_USE_RANDOM_IO_TWEAK[] = "EnableRandomIOTweak";
 const char NAME_FAST_RW_LOG_BLOCKS[] = "FASTRWLogBlocks";
 const char NAME_FAST_RW_GC_POLICY[] = "FASTRWGCPolicy";
+const char NAME_FAST_WRITE_BUFFER[] = "FASTWriteBuffer";
 
 Config::Config() {
   mapping = PAGE_MAPPING;
@@ -57,6 +58,7 @@ Config::Config() {
   randomIOTweak = true;
   fastRWLogBlocks = 8;
   fastRWGCPolicy = 0;
+  fastWriteBuffer = 0;
 }
 
 bool Config::setConfig(const char *name, const char *value) {
@@ -106,6 +108,9 @@ bool Config::setConfig(const char *name, const char *value) {
   }
   else if (MATCH_NAME(NAME_FAST_RW_GC_POLICY)) {
     fastRWGCPolicy = strtoul(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_FAST_WRITE_BUFFER)) {
+    fastWriteBuffer = strtoul(value, nullptr, 10);
   }
   else {
     ret = false;
@@ -171,6 +176,9 @@ uint64_t Config::readUint(uint32_t idx) {
       break;
     case FTL_FAST_RW_GC_POLICY:
       ret = fastRWGCPolicy;
+      break;
+    case FTL_FAST_WRITE_BUFFER:
+      ret = fastWriteBuffer;
       break;
   }
 

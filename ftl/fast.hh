@@ -77,8 +77,30 @@ class FAST : public AbstractFTL {
   uint32_t maxRWLogs;
   uint32_t rwGCPolicy;  // RW 로그 victim 선택 방식 (0: FIFO, 1: greedy)
 
-  // RW 로그의 섹터 매핑 테이블 (lpn * lane 수 + lane -> (블록, 페이지))
-  std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> rwMap;
+  // RW 로그에서 sector가 실제로 놓인 위치. 쓰기 버퍼를 쓰면 sector가 논리 lane과
+  // 다른 lane(채널)에 놓일 수 있으므로 실제 lane도 함께 기록한다.
+  struct SectorLoc {
+    uint32_t pbn;
+    uint32_t page;
+    uint32_t lane;  // 실제로 쓴 lane (SuperblockSize = C이면 채널 번호)
+  };
+
+  // RW 로그의 섹터 매핑 테이블 (sector 키 = lpn * lane 수 + 논리 lane -> 위치).
+  // RW 로그 블록의 각 칸에는 lpn 대신 sector 키를 저장해서 논리 lane을 되찾는다.
+  std::unordered_map<uint64_t, SectorLoc> rwMap;
+
+  // RW 로그 쓰기 버퍼 (FASTWriteBuffer = 1).
+  // RW 로그로 가는 업데이트 쓰기를 lane 수만큼 모았다가 슈퍼페이지 1개로 한 번에 쓴다.
+  bool useWriteBuffer;
+  std::vector<uint64_t> wbuf;                      // 버퍼에 있는 sector 키
+  std::unordered_map<uint64_t, size_t> wbufIndex;  // sector 키 -> wbuf 위치
+
+  // chip(슬롯)별로 지금 채우고 있는 RW 로그 블록 (-1이면 없음).
+  // flush마다 다음 슬롯으로 돌아가며 써서 chip 병렬성을 얻는다.
+  std::vector<int64_t> openRW;
+  uint32_t nOpenSlots;  // min(chip 수, FASTRWLogBlocks)
+  uint32_t rwChip;      // 다음 flush가 쓸 슬롯
+  uint32_t bufferedInReq;  // 지금 요청에서 버퍼에 넣은 sector 수 (DRAM 지연 계산용)
 
   // 새 블록을 할당할 때 chip(= blockIdx % pageCountToMaxPerf)을 돌아가며 고른다
   uint32_t allocChip;
@@ -120,12 +142,22 @@ class FAST : public AbstractFTL {
     uint64_t sectorCopies;
     uint64_t nandWritePages;
     uint64_t eraseCount;
+    uint64_t bufferFlushes;   // 쓰기 버퍼 flush 횟수
+    uint64_t bufferAbsorbed;  // 버퍼 안에서 덮어써져 NAND에 쓰지 않은 sector 수
+    uint64_t bufferWriteOps;  // flush가 발행한 NAND 쓰기 요청 수 (정상이면 flush 수와 같다)
   } stat;
 
+  // 채널(lane)별, chip별 NAND write/erase 횟수.
+  // lane을 채널로 보는 것은 SuperblockSize = C일 때 맞다 (FAST 필수 설정).
+  // chip은 블록 번호 % pageCountToMaxPerf이다.
+  std::vector<uint64_t> chanWrite;
+  std::vector<uint64_t> chanErase;
+  std::vector<uint64_t> chipWrite;
   std::vector<uint64_t> chipEraseCount;
 
   // 블록 관리
   uint32_t getFreeBlock();
+  uint32_t getFreeBlockOnChip(uint32_t);
   void insertFreeBlock(Block &&);
   void eraseBlock(uint32_t);
   void eraseBlockNow(uint32_t, uint64_t &);
@@ -136,16 +168,28 @@ class FAST : public AbstractFTL {
 
   // sector 단위 조회와 쓰기
   bool isValid(uint32_t, uint32_t, uint32_t);
+  bool findLatest(uint64_t, uint32_t, uint32_t &, uint32_t &, uint32_t &);
   bool findLatest(uint64_t, uint32_t, uint32_t &, uint32_t &);
   void invalidateLatest(uint64_t, uint32_t);
   void writeSector(uint32_t, uint32_t, uint64_t, uint32_t);
-  void copySector(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+  void copySector(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                  uint32_t);
   void mapSector(uint64_t);
   void unmapSector(uint64_t);
 
   // FAST 동작
   void writeToLog(uint64_t, uint32_t);
   void writeToRW(uint64_t, uint32_t);
+  void writeRW(uint64_t, uint32_t);
+
+  // 쓰기 버퍼
+  bool inBuffer(uint64_t);
+  void bufferSector(uint64_t, uint32_t);
+  void dropFromBuffer(uint64_t);
+  void flushWriteBuffer();
+  uint32_t ensureOpenRW(uint32_t);
+  bool isRWFull(uint32_t);
+  bool isOpenRW(uint32_t);
   void startSW(uint64_t);
   void appendSW(uint64_t, uint32_t);
   void mergeSW();

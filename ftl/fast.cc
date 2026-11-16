@@ -56,9 +56,9 @@ FAST::FAST(ConfigReader &c, Parameter &p, PAL::PAL *l, DRAM::AbstractDRAM *d)
   bufferedInReq = 0;
   useWriteBuffer = conf.readUint(CONFIG_FTL, FTL_FAST_WRITE_BUFFER) == 1;
 
-  // 열린 RW 로그 슬롯은 chip 수와 RW 로그 한도 중 작은 값만큼 둔다
-  nOpenSlots = MIN(param.pageCountToMaxPerf, maxRWLogs);
-  openRW.assign(nOpenSlots, -1);
+  // 열린 RW 로그 블록은 chip마다 최대 1개, 총 min(chip 수, RW 로그 한도)개
+  nOpenRW = MIN(param.pageCountToMaxPerf, maxRWLogs);
+  openRW.assign(nOpenRW, -1);
 
   // 데이터 블록 전체 + SW 로그 1개 + RW 로그 + merge용 여유 블록 2개가 필요하다
   if (param.totalPhysicalBlocks <
@@ -878,9 +878,13 @@ void FAST::verifyRWVictim(std::list<uint32_t>::iterator sel) {
     panic("ftl: victim 후보가 없습니다");
   }
 
-  // 쓰기 버퍼 모드에서는 victim이 모든 lane에서 꽉 찬 블록이어야 한다
-  if (useWriteBuffer && !isRWFull(*sel)) {
-    panic("ftl: 다 차지 않은 RW 로그 %u를 victim으로 골랐습니다", *sel);
+  // 쓰기 버퍼 모드에서는 모든 RW 로그 블록이 다 찼을 때만 merge 해야 한다
+  if (useWriteBuffer) {
+    for (auto pbn : rwLogs) {
+      if (!isRWFull(pbn)) {
+        panic("ftl: RW 로그 블록 %u가 다 차지 않았는데 merge 했습니다", pbn);
+      }
+    }
   }
 
   if (sel != expect) {
@@ -997,7 +1001,7 @@ bool FAST::inBuffer(uint64_t key) {
   return wbufIndex.count(key) > 0;
 }
 
-// 지금 어떤 슬롯에서 채우고 있는 RW 로그인지 확인한다
+// 열린 RW 로그 블록(버퍼 flush가 쓰는 중인 블록)인지 확인한다
 bool FAST::isOpenRW(uint32_t pbn) {
   for (auto iter : openRW) {
     if (iter == (int64_t)pbn) {
@@ -1067,31 +1071,60 @@ void FAST::dropFromBuffer(uint64_t key) {
   wbufIndex.erase(key);
 }
 
-// 슬롯의 열린 RW 로그를 돌려준다. 없거나 모든 lane이 다 찼으면 닫고 새 블록을
-// 연다. 이때 RW 로그가 한도만큼 있으면 다 찬 RW 로그 중 victim을 merge/erase 한다.
-uint32_t FAST::ensureOpenRW(uint32_t slot) {
-  int64_t cur = openRW.at(slot);
+// flush가 쓸 열린 RW 로그 블록을 돌려준다. chip이 정해 둔 블록이 없거나 다 찼으면
+//  1. 다 찬 블록은 닫는다 (victim 후보가 된다)
+//  2. RW 로그 블록 수가 한도보다 적으면 그 chip에 새 블록을 연다
+//  3. 한도에 도달했으면 merge하지 않고, 빈 칸이 남은 다른 열린 RW 로그 블록에 쓴다
+//  4. 모든 RW 로그 블록이 다 찼을 때만 victim을 merge/erase 하고 새 블록을 연다
+// 그래서 merge 시점에는 모든 RW 로그 블록이 닫혀 있고, 정책(FIFO/greedy)이 그중에서
+// victim을 고를 수 있다.
+uint32_t FAST::ensureOpenRW(uint32_t chip) {
+  int64_t cur = openRW.at(chip);
 
   if (cur >= 0 && !isRWFull((uint32_t)cur)) {
     return (uint32_t)cur;
   }
 
-  // 다 찬 블록은 닫아서 victim 후보가 되게 한다
-  openRW.at(slot) = -1;
+  openRW.at(chip) = -1;
 
-  if (rwLogs.size() >= maxRWLogs) {
-    mergeRWVictim();
+  if (rwLogs.size() < maxRWLogs) {
+    uint32_t pbn = getFreeBlockOnChip(chip % param.pageCountToMaxPerf);
+
+    rwLogs.push_back(pbn);
+    openRW.at(chip) = (int64_t)pbn;
+
+    return pbn;
   }
 
-  uint32_t pbn = getFreeBlockOnChip(slot % param.pageCountToMaxPerf);
+  // 다른 chip의 열린 RW 로그 블록 중 빈 칸이 남은 것을 chip 순서대로 찾는다.
+  // 그 사이에 만난 다 찬 블록도 닫는다.
+  for (uint32_t k = 1; k < nOpenRW; k++) {
+    uint32_t other = (chip + k) % nOpenRW;
+    int64_t pbn = openRW.at(other);
+
+    if (pbn < 0) {
+      continue;
+    }
+
+    if (!isRWFull((uint32_t)pbn)) {
+      return (uint32_t)pbn;
+    }
+
+    openRW.at(other) = -1;
+  }
+
+  // 모든 RW 로그 블록이 다 찼다: victim을 비우고 이 chip에 새 블록을 연다
+  mergeRWVictim();
+
+  uint32_t pbn = getFreeBlockOnChip(chip % param.pageCountToMaxPerf);
 
   rwLogs.push_back(pbn);
-  openRW.at(slot) = (int64_t)pbn;
+  openRW.at(chip) = (int64_t)pbn;
 
   return pbn;
 }
 
-// 버퍼의 sector를 지금 슬롯의 RW 로그에 쓴다. sector마다 쓰기 포인터가 가장 낮은
+// 버퍼의 sector를 이번 차례 chip의 열린 RW 로그 블록에 쓴다. sector마다 쓰기 포인터가 가장 낮은
 // lane을 고르므로, 버퍼가 꽉 찼을 때는 같은 페이지의 모든 lane(채널)에 한 번에
 // 쓰이고 queueOp가 이를 NAND 요청 1개로 묶는다.
 void FAST::flushWriteBuffer() {
@@ -1105,15 +1138,15 @@ void FAST::flushWriteBuffer() {
   keys.swap(wbuf);
   wbufIndex.clear();
 
-  uint32_t slot = rwChip;
+  uint32_t chip = rwChip;
 
-  rwChip = (rwChip + 1) % nOpenSlots;
+  rwChip = (rwChip + 1) % nOpenRW;
 
   // 이번 flush가 만든 NAND 쓰기 요청 (같은 블록/페이지의 lane은 한 요청으로 묶인다)
   std::vector<PageOp> flushOps;
 
   for (auto key : keys) {
-    uint32_t target = ensureOpenRW(slot);
+    uint32_t target = ensureOpenRW(chip);
     auto &block = blocks.at(target);
     uint32_t physLane = 0;
     uint32_t page = param.pagesInBlock;
@@ -1148,7 +1181,8 @@ void FAST::flushWriteBuffer() {
     stat.bufferWriteOps += flushOps.size();
 
     // 확인용 로그: lane 비트가 모두 1이면 슈퍼페이지 1개로 모든 채널에 쓴 것이다.
-    // chip은 블록 번호 % chip 수이며, 슬롯과 다르면 그 chip에 빈 블록이 없었던 것이다.
+    // turn은 이번 차례 chip, chip은 실제로 쓴 블록의 chip(블록 번호 % chip 수)이다.
+    // 둘이 다르면 그 chip의 블록이 다 차서 다른 열린 RW 로그 블록에 쓴 것이다.
     for (auto &op : flushOps) {
       std::string lanes;
 
@@ -1157,8 +1191,8 @@ void FAST::flushWriteBuffer() {
       }
 
       debugprint(LOG_FTL_FAST,
-                 "FLUSH | slot %u | chip %u | block %u | page %u | lanes %s",
-                 slot, op.pbn % param.pageCountToMaxPerf, op.pbn, op.page,
+                 "FLUSH | turn %u | chip %u | block %u | page %u | lanes %s",
+                 chip, op.pbn % param.pageCountToMaxPerf, op.pbn, op.page,
                  lanes.c_str());
     }
   }

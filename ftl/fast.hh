@@ -95,11 +95,13 @@ class FAST : public AbstractFTL {
   std::vector<uint64_t> wbuf;                      // 버퍼에 있는 sector 키
   std::unordered_map<uint64_t, size_t> wbufIndex;  // sector 키 -> wbuf 위치
 
-  // chip(슬롯)별로 지금 채우고 있는 RW 로그 블록 (-1이면 없음).
-  // flush마다 다음 슬롯으로 돌아가며 써서 chip 병렬성을 얻는다.
+  // chip별 열린 RW 로그 블록 (-1이면 없음). 열린 RW 로그 블록은 버퍼 flush가
+  // 쓰는 중인 블록이고, 다 차면 닫혀서 victim 후보가 된다.
+  // flush는 chip을 돌아가며 써서 chip 사이 병렬성을 얻는다.
+  // (flush = 버퍼의 sector를 열린 RW 로그 블록 1개의 슈퍼페이지 1개에 쓰는 것)
   std::vector<int64_t> openRW;
-  uint32_t nOpenSlots;  // min(chip 수, FASTRWLogBlocks)
-  uint32_t rwChip;      // 다음 flush가 쓸 슬롯
+  uint32_t nOpenRW;  // 열린 RW 로그 블록 최대 수 = min(chip 수, FASTRWLogBlocks)
+  uint32_t rwChip;   // 다음 flush가 쓸 chip
   uint32_t bufferedInReq;  // 지금 요청에서 버퍼에 넣은 sector 수 (DRAM 지연 계산용)
 
   // 새 블록을 할당할 때 chip(= blockIdx % pageCountToMaxPerf)을 돌아가며 고른다

@@ -23,6 +23,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <iterator>
 
 #include "util/algorithm.hh"
@@ -48,8 +49,9 @@ FAST::FAST(ConfigReader &c, Parameter &p, PAL::PAL *l, DRAM::AbstractDRAM *d)
 
   rwGCPolicy = conf.readUint(CONFIG_FTL, FTL_FAST_RW_GC_POLICY);
 
-  if (rwGCPolicy > 1) {
-    panic("ftl: FASTRWGCPolicy는 0(FIFO) 또는 1(greedy)이어야 합니다");
+  if (rwGCPolicy > 2) {
+    panic("ftl: FASTRWGCPolicy는 0(FIFO), 1(greedy), 2(논리 블록 단위 merge) 중 "
+          "하나여야 합니다");
   }
 
   rwChip = 0;
@@ -604,7 +606,7 @@ void FAST::invalidateLatest(uint64_t lpn, uint32_t lane) {
   if (findLatest(lpn, lane, pbn, page, physLane)) {
     blocks.at(pbn).invalidate(page, physLane);
 
-    rwMap.erase(lpn * param.ioUnitInPage + lane);
+    eraseRWLoc(lpn * param.ioUnitInPage + lane);
   }
 }
 
@@ -642,9 +644,79 @@ void FAST::copySector(uint64_t lpn, uint32_t lane, uint32_t srcBlock,
 
   blocks.at(srcBlock).invalidate(srcPage, srcLane);
 
-  rwMap.erase(lpn * param.ioUnitInPage + lane);
+  eraseRWLoc(lpn * param.ioUnitInPage + lane);
 
   writeSector(dstBlock, dstPage, lpn, lane);
+}
+
+// RW 섹터 맵에 위치를 기록하고 논리 블록의 로그 점유 sector 수를 맞춘다
+void FAST::setRWLoc(uint64_t key, const SectorLoc &loc) {
+  auto iter = rwMap.find(key);
+
+  if (iter == rwMap.end()) {
+    rwMap.emplace(key, loc);
+
+    lbnLogCount[key / param.ioUnitInPage / param.pagesInBlock]++;
+  }
+  else {
+    iter->second = loc;
+  }
+}
+
+// RW 섹터 맵에서 지우고 논리 블록의 로그 점유 sector 수를 맞춘다 (없으면 아무 일도 안 함)
+void FAST::eraseRWLoc(uint64_t key) {
+  if (rwMap.erase(key) == 0) {
+    return;
+  }
+
+  auto iter = lbnLogCount.find(key / param.ioUnitInPage / param.pagesInBlock);
+
+  if (iter == lbnLogCount.end()) {
+    panic("ftl: 로그 점유 sector 수가 RW 섹터 맵과 맞지 않습니다");
+  }
+
+  if (--(iter->second) == 0) {
+    lbnLogCount.erase(iter);
+  }
+}
+
+// victim merge 직전의 RW 로그 상태를 진단용 통계에 더한다 (동작에는 영향 없음)
+void FAST::recordMergeDiag(uint32_t victim, size_t victimLbns) {
+  if (!bSendToPAL) {
+    return;
+  }
+
+  std::vector<uint32_t> counts;
+
+  counts.reserve(lbnLogCount.size());
+
+  for (auto &iter : lbnLogCount) {
+    counts.push_back(iter.second);
+  }
+
+  std::sort(counts.begin(), counts.end(), std::greater<uint32_t>());
+
+  // 로그 점유가 많은 논리 블록부터 full merge 한다고 할 때, 블록 1개 분량의
+  // sector를 RW 로그에서 무효로 만들려면 논리 블록이 몇 개 필요한지 센다
+  uint64_t target = (uint64_t)param.pagesInBlock * param.ioUnitInPage;
+  uint64_t sum = 0;
+  uint64_t need = 0;
+
+  for (auto c : counts) {
+    if (sum >= target) {
+      break;
+    }
+
+    sum += c;
+    need++;
+  }
+
+  stat.diagVictimLbns += victimLbns;
+  stat.diagVictimValid += blocks.at(victim).getValidPageCountRaw();
+  stat.diagLogLbns += counts.size();
+  stat.diagLogValid += rwMap.size();
+  stat.diagTopLbnCount += counts.empty() ? 0 : counts.front();
+  stat.diagLbnsForBlock += need;
 }
 
 void FAST::mapSector(uint64_t lpn) {
@@ -901,40 +973,69 @@ void FAST::verifyRWVictim(std::list<uint32_t>::iterator sel) {
 // 여러 논리 블록의 merge 요청을 하나의 batch로 모아 채널/chip 병렬성을 쓴다.
 void FAST::mergeRWVictim() {
   auto victimIter = selectRWVictim();
-#ifdef FAST_VERIFY_VICTIM
-  verifyRWVictim(victimIter);
-#endif
+
   if (victimIter == rwLogs.end()) {
     panic("ftl: RW 로그 victim 후보가 없습니다");
   }
 
-  uint32_t victim = *victimIter;
-  std::vector<uint64_t> unique;
-  std::vector<uint64_t> lpns;
-  Bitset bit(param.ioUnitInPage);
+  if (rwGCPolicy == 2) {
+    // 정책 2: victim에 걸린 논리 블록을 전부 full merge 하지 않는다.
+    // RW 로그 1칸당 복사량이 가장 적은 논리 블록부터 full merge 하고, 유효 sector가
+    // 가장 적은 RW 로그 블록(victim)이 완전히 비면 멈춘다.
+    recordMergeDiag(*victimIter, 0);
 
-  auto &block = blocks.at(victim);
+    while (blocks.at(*victimIter).getValidPageCountRaw() > 0) {
+      uint64_t lbn = 0;
 
-  // victim의 유효 sector가 속한 논리 블록을 등장 순서대로 모은다
-  for (uint32_t page = 0; page < param.pagesInBlock; page++) {
-    if (block.getPageInfo(page, lpns, bit)) {
-      for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
-        if (bit.test(lane)) {
-          // RW 로그 칸에는 sector 키(lpn * lane 수 + 논리 lane)가 저장되어 있다
-          uint64_t lbn =
-              lpns.at(lane) / param.ioUnitInPage / param.pagesInBlock;
+      if (!selectMergeLbn(lbn)) {
+        panic("ftl: victim에 유효 sector가 있는데 merge할 논리 블록이 없습니다");
+      }
 
-          if (std::find(unique.begin(), unique.end(), lbn) == unique.end()) {
-            unique.push_back(lbn);
+      mergeLbn(lbn);
+
+      if (bSendToPAL) {
+        stat.lbnMerges++;
+      }
+
+      // full merge로 유효 sector 수가 바뀌었으므로 victim을 다시 고른다
+      victimIter = selectRWVictim();
+    }
+  }
+  else {
+#ifdef FAST_VERIFY_VICTIM
+    verifyRWVictim(victimIter);
+#endif
+    std::vector<uint64_t> unique;
+    std::vector<uint64_t> lpns;
+    Bitset bit(param.ioUnitInPage);
+
+    auto &block = blocks.at(*victimIter);
+
+    // victim의 유효 sector가 속한 논리 블록을 등장 순서대로 모은다
+    for (uint32_t page = 0; page < param.pagesInBlock; page++) {
+      if (block.getPageInfo(page, lpns, bit)) {
+        for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
+          if (bit.test(lane)) {
+            // RW 로그 칸에는 sector 키(lpn * lane 수 + 논리 lane)가 저장되어 있다
+            uint64_t lbn =
+                lpns.at(lane) / param.ioUnitInPage / param.pagesInBlock;
+
+            if (std::find(unique.begin(), unique.end(), lbn) == unique.end()) {
+              unique.push_back(lbn);
+            }
           }
         }
       }
     }
+
+    recordMergeDiag(*victimIter, unique.size());
+
+    for (auto lbn : unique) {
+      mergeLbn(lbn);
+    }
   }
 
-  for (auto lbn : unique) {
-    mergeLbn(lbn);
-  }
+  uint32_t victim = *victimIter;
 
   // 이제 victim에는 유효 sector가 없다
   rwLogs.erase(victimIter);
@@ -949,6 +1050,57 @@ void FAST::mergeRWVictim() {
   }
 
   flushBatch();
+}
+
+/* ------------------ 정책 2: 논리 블록 단위 merge ------------------ */
+
+// 논리 블록을 full merge 할 때 복사할 sector 수 (그 논리 블록의 유효 sector 수)
+uint64_t FAST::lbnMergeCost(uint64_t lbn) {
+  uint64_t cost = 0;
+  auto log = lbnLogCount.find(lbn);
+
+  if (log != lbnLogCount.end()) {
+    cost += log->second;
+  }
+
+  auto data = dataBlockMap.find(lbn);
+
+  if (data != dataBlockMap.end()) {
+    cost += blocks.at(data->second).getValidPageCountRaw();
+  }
+
+  if (sw.valid && sw.lbn == lbn) {
+    cost += blocks.at(sw.pbn).getValidPageCountRaw();
+  }
+
+  return cost;
+}
+
+// 정책 2에서 다음에 full merge 할 논리 블록을 고른다.
+// full merge는 그 논리 블록의 유효 sector M개를 복사해서, RW 로그에 있던 L개
+// (로그 점유 sector 수)를 무효로 만든다. RW 로그 1칸을 비우는 데 드는 복사량
+// M / L이 가장 작은 논리 블록을 고른다. 같으면 번호가 작은 쪽을 고른다.
+// RW 로그에 sector가 있는 논리 블록이 없으면 false.
+bool FAST::selectMergeLbn(uint64_t &lbn) {
+  bool found = false;
+  uint64_t bestCost = 0;
+  uint64_t bestCount = 0;
+
+  for (auto &iter : lbnLogCount) {
+    uint64_t cost = lbnMergeCost(iter.first);
+    uint64_t count = iter.second;
+
+    // cost / count < bestCost / bestCount 를 나눗셈 없이 비교한다
+    if (!found || cost * bestCount < bestCost * count ||
+        (cost * bestCount == bestCost * count && iter.first < lbn)) {
+      found = true;
+      lbn = iter.first;
+      bestCost = cost;
+      bestCount = count;
+    }
+  }
+
+  return found;
 }
 
 // RW 로그에 쓴다. 해당 lane에 빈 칸이 있는 가장 오래된 블록을 쓰고, 없으면 새
@@ -982,7 +1134,7 @@ void FAST::writeToRW(uint64_t lpn, uint32_t lane) {
   invalidateLatest(lpn, lane);
   writeSector(target, page, key, lane);
 
-  rwMap[key] = {target, page, lane};
+  setRWLoc(key, {target, page, lane});
 }
 
 // RW 로그로 가는 쓰기: 쓰기 버퍼를 쓰면 버퍼에 넣고, 아니면 바로 RW 로그에 쓴다
@@ -1163,7 +1315,7 @@ void FAST::flushWriteBuffer() {
     // NAND의 이전 버전은 버퍼에 넣을 때 이미 무효화했다
     writeSector(target, page, key, physLane);
 
-    rwMap[key] = {target, page, physLane};
+    setRWLoc(key, {target, page, physLane});
 
     if (flushOps.empty() || flushOps.back().pbn != target ||
         flushOps.back().page != page) {
@@ -1525,6 +1677,35 @@ void FAST::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.desc = "Total sectors overwritten in RW write buffer (not programmed)";
   list.push_back(temp);
 
+  // 진단용 합계: fast.rw_victims로 나누면 victim merge 1회당 평균이 된다
+  temp.name = prefix + "fast.diag.victim_lbns";
+  temp.desc = "Sum of logical blocks associated with each victim";
+  list.push_back(temp);
+
+  temp.name = prefix + "fast.diag.victim_valid";
+  temp.desc = "Sum of valid sectors in each victim";
+  list.push_back(temp);
+
+  temp.name = prefix + "fast.diag.log_lbns";
+  temp.desc = "Sum of logical blocks having sectors in RW log (at each victim merge)";
+  list.push_back(temp);
+
+  temp.name = prefix + "fast.diag.log_valid";
+  temp.desc = "Sum of valid sectors in RW log (at each victim merge)";
+  list.push_back(temp);
+
+  temp.name = prefix + "fast.diag.top_lbn_count";
+  temp.desc = "Sum of max RW-log sector count of one logical block";
+  list.push_back(temp);
+
+  temp.name = prefix + "fast.diag.lbns_for_block";
+  temp.desc = "Sum of logical blocks (largest first) needed to cover one block of RW-log sectors";
+  list.push_back(temp);
+
+  temp.name = prefix + "fast.merge.by_lbn";
+  temp.desc = "Full merges of logical blocks chosen by policy 2";
+  list.push_back(temp);
+
   temp.name = prefix + "fast.buffer.write_ops";
   temp.desc = "NAND write requests issued by buffer flush (== flushes if each "
               "flush is one superpage)";
@@ -1563,6 +1744,13 @@ void FAST::getStatValues(std::vector<double> &values) {
 
   values.push_back(stat.bufferFlushes);
   values.push_back(stat.bufferAbsorbed);
+  values.push_back(stat.diagVictimLbns);
+  values.push_back(stat.diagVictimValid);
+  values.push_back(stat.diagLogLbns);
+  values.push_back(stat.diagLogValid);
+  values.push_back(stat.diagTopLbnCount);
+  values.push_back(stat.diagLbnsForBlock);
+  values.push_back(stat.lbnMerges);
   values.push_back(stat.bufferWriteOps);
 }
 

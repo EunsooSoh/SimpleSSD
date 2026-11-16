@@ -105,6 +105,16 @@ static void verify(FAST &f, Parameter &p, std::set<uint64_t> &model, const char 
     CHECK(std::find(f.rwLogs.begin(), f.rwLogs.end(), e.second.pbn) != f.rwLogs.end(), "[%s %d] rwMap points outside rw logs", when, step);
   }
   CHECK(f.rwLogs.size() <= f.maxRWLogs, "[%s %d] too many rw logs", when, step);
+  // 논리 블록별 로그 점유 sector 수는 rwMap에서 다시 센 값과 같아야 한다
+  {
+    std::map<uint64_t, uint32_t> byLbn;
+    for (auto &e : f.rwMap) byLbn[e.first / U / p.pagesInBlock]++;
+    CHECK(byLbn.size() == f.lbnLogCount.size(), "[%s %d] lbnLogCount size %zu != %zu", when, step, f.lbnLogCount.size(), byLbn.size());
+    for (auto &e : byLbn) {
+      auto it = f.lbnLogCount.find(e.first);
+      CHECK(it != f.lbnLogCount.end() && it->second == e.second, "[%s %d] lbnLogCount mismatch at lbn %" PRIu64, when, step, e.first);
+    }
+  }
 
   // victim 선택 검사: selectRWVictim()은 상태를 바꾸지 않으므로 매 단계 호출해 볼 수 있다.
   // 블록의 유효 sector 수는 Block이 아니라 rwMap에서 따로 세어 서로 대조한다.
@@ -205,9 +215,9 @@ int main(int argc, char **argv) {
   p.ioUnitInPage = 4;
   p.pageCountToMaxPerf = 4;
 
-  // RW 로그 victim 정책(0: FIFO, 1: greedy) × ioUnit × 쓰기 버퍼(0, 1)를 모두 검사한다
+  // RW 로그 정책(0: FIFO, 1: greedy, 2: 논리 블록 단위 merge) × ioUnit × 쓰기 버퍼(0, 1)를 모두 검사한다
   for (int buffer : {0, 1})
-  for (int policy : {0, 1})
+  for (int policy : {0, 1, 2})
   for (int ioUnit : {4, 1}) {
     std::string cfg = makeTestConfig(argv[1], policy, buffer);
     ConfigReader conf;

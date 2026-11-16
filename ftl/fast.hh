@@ -75,7 +75,12 @@ class FAST : public AbstractFTL {
   // RW(랜덤 쓰기) 로그 블록: 가장 앞이 가장 오래된 블록(victim 후보)
   std::list<uint32_t> rwLogs;
   uint32_t maxRWLogs;
-  uint32_t rwGCPolicy;  // RW 로그 victim 선택 방식 (0: FIFO, 1: greedy)
+  // RW 로그 공간 회수 방식
+  //  0: FIFO victim + 걸린 논리 블록 전부 full merge
+  //  1: greedy victim + 걸린 논리 블록 전부 full merge
+  //  2: 논리 블록 단위 merge (RW 로그 1칸당 복사량이 가장 적은 논리 블록부터
+  //     full merge 하고, RW 로그 블록 하나가 완전히 비면 그 블록을 erase)
+  uint32_t rwGCPolicy;
 
   // RW 로그에서 sector가 실제로 놓인 위치. 쓰기 버퍼를 쓰면 sector가 논리 lane과
   // 다른 lane(채널)에 놓일 수 있으므로 실제 lane도 함께 기록한다.
@@ -88,6 +93,10 @@ class FAST : public AbstractFTL {
   // RW 로그의 섹터 매핑 테이블 (sector 키 = lpn * lane 수 + 논리 lane -> 위치).
   // RW 로그 블록의 각 칸에는 lpn 대신 sector 키를 저장해서 논리 lane을 되찾는다.
   std::unordered_map<uint64_t, SectorLoc> rwMap;
+
+  // 논리 블록별 로그 점유 sector 수: 그 논리 블록의 유효 sector 중 RW 로그 블록에
+  // 있는 개수 (0이면 항목 없음). rwMap과 항상 함께 갱신한다 (setRWLoc/eraseRWLoc).
+  std::unordered_map<uint64_t, uint32_t> lbnLogCount;
 
   // RW 로그 쓰기 버퍼 (FASTWriteBuffer = 1).
   // RW 로그로 가는 업데이트 쓰기를 lane 수만큼 모았다가 슈퍼페이지 1개로 한 번에 쓴다.
@@ -147,6 +156,15 @@ class FAST : public AbstractFTL {
     uint64_t bufferFlushes;   // 쓰기 버퍼 flush 횟수
     uint64_t bufferAbsorbed;  // 버퍼 안에서 덮어써져 NAND에 쓰지 않은 sector 수
     uint64_t bufferWriteOps;  // flush가 발행한 NAND 쓰기 요청 수 (정상이면 flush 수와 같다)
+    uint64_t lbnMerges;         // 정책 2가 고른 논리 블록 full merge 수
+
+    // 진단용 합계 (victim merge 때마다 더한다. victim 수로 나누면 평균이 된다)
+    uint64_t diagVictimLbns;    // victim에 걸린 논리 블록 수
+    uint64_t diagVictimValid;   // victim의 유효 sector 수
+    uint64_t diagLogLbns;       // RW 로그 전체에 sector가 있는 논리 블록 수
+    uint64_t diagLogValid;      // RW 로그 전체의 유효 sector 수
+    uint64_t diagTopLbnCount;   // 로그 점유 sector 수의 최댓값
+    uint64_t diagLbnsForBlock;  // 로그 점유가 많은 순으로 블록 1개 분량을 채우는 데 필요한 논리 블록 수
   } stat;
 
   // 채널(lane)별, chip별 NAND write/erase 횟수.
@@ -176,6 +194,9 @@ class FAST : public AbstractFTL {
   void writeSector(uint32_t, uint32_t, uint64_t, uint32_t);
   void copySector(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
                   uint32_t);
+  void setRWLoc(uint64_t, const SectorLoc &);
+  void eraseRWLoc(uint64_t);
+  void recordMergeDiag(uint32_t, size_t);
   void mapSector(uint64_t);
   void unmapSector(uint64_t);
 
@@ -202,6 +223,10 @@ class FAST : public AbstractFTL {
   void verifyRWVictim(std::list<uint32_t>::iterator);
 #endif
   void mergeRWVictim();
+
+  // 정책 2: 논리 블록 단위 merge
+  bool selectMergeLbn(uint64_t &);
+  uint64_t lbnMergeCost(uint64_t);
 
   void readInternal(Request &, uint64_t &);
   void writeInternal(Request &, uint64_t &);

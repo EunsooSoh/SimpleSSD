@@ -41,6 +41,7 @@ const char NAME_USE_RANDOM_IO_TWEAK[] = "EnableRandomIOTweak";
 const char NAME_FAST_RW_LOG_BLOCKS[] = "FASTRWLogBlocks";
 const char NAME_FAST_RW_GC_POLICY[] = "FASTRWGCPolicy";
 const char NAME_FAST_WRITE_BUFFER[] = "FASTWriteBuffer";
+const char NAME_FAST_RW_COMPACTION[] = "FASTRWCompaction";
 
 Config::Config() {
   mapping = PAGE_MAPPING;
@@ -59,6 +60,7 @@ Config::Config() {
   fastRWLogBlocks = 8;
   fastRWGCPolicy = 0;
   fastWriteBuffer = 0;
+  fastRWCompaction = 0;
 }
 
 bool Config::setConfig(const char *name, const char *value) {
@@ -112,6 +114,9 @@ bool Config::setConfig(const char *name, const char *value) {
   else if (MATCH_NAME(NAME_FAST_WRITE_BUFFER)) {
     fastWriteBuffer = strtoul(value, nullptr, 10);
   }
+  else if (MATCH_NAME(NAME_FAST_RW_COMPACTION)) {
+    fastRWCompaction = strtoul(value, nullptr, 10);
+  }
   else {
     ret = false;
   }
@@ -120,6 +125,9 @@ bool Config::setConfig(const char *name, const char *value) {
 }
 
 void Config::update() {
+  if (fastRWCompaction > 1) {
+    panic("Invalid FASTRWCompaction (expected 0 or 1)");
+  }
   if (gcMode == GC_MODE_0 && reclaimBlock == 0) {
     panic("Invalid GCReclaimBlocks");
   }
@@ -179,6 +187,9 @@ uint64_t Config::readUint(uint32_t idx) {
       break;
     case FTL_FAST_WRITE_BUFFER:
       ret = fastWriteBuffer;
+      break;
+    case FTL_FAST_RW_COMPACTION:
+      ret = fastRWCompaction;
       break;
   }
 

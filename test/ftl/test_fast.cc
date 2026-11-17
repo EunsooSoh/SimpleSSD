@@ -142,7 +142,7 @@ static void verify(FAST &f, Parameter &p, std::set<uint64_t> &model, const char 
 
 // 설정 파일을 읽어 FASTRWLogBlocks만 작은 값으로 바꾸고 FASTRWGCPolicy를 지정한
 // 임시 설정 파일을 만든다 (RW 로그가 자주 가득 차서 merge 경로가 많이 실행되게 하기 위함)
-static std::string makeTestConfig(const char *path, int policy, int buffer) {
+static std::string makeTestConfig(const char *path, int policy, int buffer, int compaction) {
   std::ifstream in(path);
   std::string tmp = "test_fast.tmp.cfg";
   std::ofstream out(tmp);
@@ -157,6 +157,8 @@ static std::string makeTestConfig(const char *path, int policy, int buffer) {
   }
 
   while (std::getline(in, line)) {
+    // 새 옵션이 없는 이전 설정 파일도 테스트할 수 있도록 버퍼 옵션 뒤에 삽입한다.
+    if (line.compare(0, 16, "FASTRWCompaction") == 0) continue;
     if (line.compare(0, 15, "FASTRWLogBlocks") == 0) {
       line = "FASTRWLogBlocks = 3";
       replaced = true;
@@ -166,7 +168,8 @@ static std::string makeTestConfig(const char *path, int policy, int buffer) {
       policyReplaced = true;
     }
     else if (line.compare(0, 15, "FASTWriteBuffer") == 0) {
-      line = "FASTWriteBuffer = " + std::to_string(buffer);
+      line = "FASTWriteBuffer = " + std::to_string(buffer) +
+             "\nFASTRWCompaction = " + std::to_string(compaction);
       bufferReplaced = true;
     }
 
@@ -191,11 +194,147 @@ static std::string makeTestConfig(const char *path, int policy, int buffer) {
   return tmp;
 }
 
+// 작은 실제 쓰기 이력으로 압축/전체 병합 선택과 매핑 보존을 따로 검증한다.
+static void testRWCompaction(const char *path) {
+  for (int buffer : {0, 1})
+  for (int lanes : {1, 4})
+  for (int scenario = 0; scenario < 6; scenario++) {
+    if (scenario == 4 && (buffer || lanes == 1)) continue;
+    std::string cfg = makeTestConfig(path, 0, buffer, 1);
+    ConfigReader conf;
+    conf.init(cfg);
+    std::remove(cfg.c_str());
+    Parameter p;
+    p.totalPhysicalBlocks = 24;
+    p.totalLogicalBlocks = 8;
+    p.pagesInBlock = 8;
+    p.ioUnitInPage = lanes;
+    p.pageSize = 4096 * lanes;
+    p.pageCountToMaxPerf = 4;
+    FAST f(conf, p, nullptr, nullptr);
+    f.bSendToPAL = false;
+    // 하나의 로그를 가득 채워서 GC의 교체 경로를 명확하게 만든다.
+    f.maxRWLogs = 1;
+    f.nOpenSlots = 1;
+    f.openRW.assign(1, -1);
+    std::set<uint64_t> model;
+    Request req(lanes);
+    uint64_t tick = 0;
+    for (uint32_t page = 0; page < p.pagesInBlock; page++) {
+      req.lpn = page;
+      req.ioFlag.set();
+      f.writeInternal(req, tick);
+      for (int lane = 0; lane < lanes; lane++) model.insert(page * lanes + lane);
+    }
+    const uint32_t oldData = f.dataBlockMap.at(0);
+    // 0: 높은 무효 비율, 1: 모두 무효, 2: 복사량/회수량 비율 불리,
+    // 3: 무효 데이터 없음, 4: 요청 lane은 모두 유효하여 복사해도 공간이 안 남음,
+    // 5: 압축 이후 호스트가 다시 쓰면 재이동 제한이 새 버전에 남지 않음.
+    // 버퍼 모드 시나리오 0은 논리 lane 0을 여러 물리 lane에 배치한다.
+    for (uint32_t page = 0; page < p.pagesInBlock; page++) {
+      for (int lane = 0; lane < lanes; lane++) {
+        uint64_t lpn = 1;
+        uint32_t logicalLane = lane;
+        if ((scenario == 0 || scenario == 5) && buffer) {
+          lpn = 1 + lane;
+          logicalLane = 0;
+        } else if (scenario == 2) {
+          lpn = page % 7;
+        } else if (scenario == 3) {
+          lpn = page;
+        } else if (scenario == 4 && lane == 0) {
+          lpn = page;
+        }
+        f.writeRW(lpn, logicalLane);
+      }
+    }
+    CHECK(f.rwLogs.size() == 1, "focused: expected exactly one log");
+    uint32_t victim = f.rwLogs.front();
+    CHECK(f.isRWFull(victim), "focused: victim should be full");
+    if (scenario == 1) {
+      req.lpn = 1;
+      f.trimInternal(req, tick);
+      for (int lane = 0; lane < lanes; lane++) model.erase(lanes + lane);
+    }
+    // ensureOpenRW가 하는 닫기와 반환 블록 연결을 여기서 직접 수행한다.
+    f.openRW[0] = -1;
+    size_t valid = f.rwMap.size();
+    uint32_t freeBefore = f.nFreeBlocks;
+    auto result = f.mergeRWVictim(buffer ? UINT32_MAX : 0);
+    if (scenario == 0 || scenario == 5) {
+      CHECK(result >= 0, "focused: sparse victim should compact");
+      if (result >= 0 && buffer) f.openRW[0] = result;
+      CHECK(f.stat.rwCompactions == 1, "focused: missing compaction count");
+      CHECK(f.stat.rwCompactionCopies == valid, "focused: copied count does not match latest sectors");
+      CHECK(f.stat.fullMerge == 0, "focused: compaction unexpectedly merged data block");
+      CHECK(f.dataBlockMap.at(0) == oldData, "focused: compaction replaced original data block");
+      CHECK(f.nFreeBlocks == freeBefore, "focused: replacement leaked a spare block");
+      CHECK(f.rwLogs.size() == 1, "focused: compaction exceeded log budget");
+      for (auto &entry : f.rwMap) {
+        CHECK(entry.second.pbn == (uint32_t)result, "focused: stale source mapping after compaction");
+        CHECK(entry.second.relocated, "focused: relocated version not marked");
+        if (!buffer) CHECK(entry.second.lane == entry.first % lanes, "focused: nonbuffer changed logical lane");
+      }
+      if (buffer && lanes > 1) {
+        bool differentLane = false;
+        for (auto &entry : f.rwMap) differentLane |= entry.second.lane != entry.first % lanes;
+        CHECK(differentLane, "focused: cross-lane relocation path was not exercised");
+      }
+      verify(f, p, model, "compact", lanes + buffer);
+
+      if (scenario == 5) {
+        CHECK(f.blocks.count(victim) == 0, "focused: compacted source still referenced");
+        req.lpn = 1;
+        req.ioFlag.reset();
+        req.ioFlag.set(0);
+        f.writeInternal(req, tick);
+        // 버퍼 ON에서도 새 버전이 NAND에 기록된 후의 플래그를 검사한다.
+        if (buffer) f.flushWriteBuffer();
+        auto latest = f.rwMap.find((uint64_t)lanes);
+        CHECK(latest != f.rwMap.end(), "focused: host overwrite did not return to RW log");
+        if (latest != f.rwMap.end()) {
+          CHECK(!latest->second.relocated, "focused: new host version retained relocation guard");
+        }
+        verify(f, p, model, "compact-host-overwrite", lanes + buffer);
+        continue;
+      }
+
+      // 살아남은 기존 버전을 그대로 둔 채 다시 채운다. 두 번째 이동 대신
+      // full merge로 돌아가서 찬 데이터가 끝없이 재이동하지 않아야 한다.
+      for (uint32_t page = 1; page < p.pagesInBlock; page++) {
+        for (int lane = 0; lane < lanes; lane++) f.writeRW(buffer ? 5 : 2, lane);
+      }
+      f.openRW[0] = -1;
+      CHECK(f.isRWFull(f.rwLogs.front()), "focused: repeated-relocation victim not full");
+      victim = f.rwLogs.front();
+      result = f.mergeRWVictim(buffer ? UINT32_MAX : 0);
+      CHECK(result < 0, "focused: same cold version was compacted twice");
+      CHECK(f.stat.rwCompactions == 1 && f.stat.fullMerge == 1,
+            "focused: repeated-relocation guard did not full merge");
+    } else {
+      CHECK(result < 0, "focused: unsuitable victim should not compact (scenario %d)", scenario);
+      CHECK(f.stat.rwCompactions == 0, "focused: unsuitable victim counted as compacted");
+      if (scenario == 1) {
+        CHECK(f.stat.fullMerge == 0, "focused: empty victim required unnecessary full merge");
+        CHECK(f.nFreeBlocks == freeBefore + 1, "focused: empty victim was not reclaimed");
+      } else {
+        CHECK(f.stat.fullMerge == 1, "focused: expected full-merge fallback (scenario %d)", scenario);
+      }
+    }
+    CHECK(f.blocks.count(victim) == 0, "focused: erased victim still referenced");
+    verify(f, p, model, "compact-fallback", scenario);
+  }
+  printf("RW compaction focused cases OK\n");
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     printf("사용법: %s <SimpleSSD 설정 파일>\n", argv[0]);
     return 2;
   }
+
+  testRWCompaction(argv[1]);
+  if (failures) return 1;
 
   Parameter p;
   p.totalPhysicalBlocks = 60;
@@ -205,16 +344,18 @@ int main(int argc, char **argv) {
   p.ioUnitInPage = 4;
   p.pageCountToMaxPerf = 4;
 
-  // RW 로그 victim 정책(0: FIFO, 1: greedy) × ioUnit × 쓰기 버퍼(0, 1)를 모두 검사한다
+  // 기존 FIFO/greedy와 버퍼 경로를 압축 OFF/ON 모두에서 검사한다.
+  for (int compaction : {0, 1})
   for (int buffer : {0, 1})
   for (int policy : {0, 1})
   for (int ioUnit : {4, 1}) {
-    std::string cfg = makeTestConfig(argv[1], policy, buffer);
+    std::string cfg = makeTestConfig(argv[1], policy, buffer, compaction);
     ConfigReader conf;
     conf.init(cfg);
     std::remove(cfg.c_str());
     p.ioUnitInPage = ioUnit;
     FAST f(conf, p, nullptr, nullptr);
+    CHECK(f.useRWCompaction == (compaction != 0), "compaction config was not applied");
     f.bSendToPAL = false;
     std::set<uint64_t> model;
     std::mt19937_64 rng(1234 + ioUnit);
@@ -278,9 +419,9 @@ int main(int argc, char **argv) {
           for (uint32_t l = 0; l < p.ioUnitInPage; l++) model.erase(lp * p.ioUnitInPage + l);
         verify(f, p, model, "format", step++);
       }
-      if (failures) { printf("stopped at round %d (buffer %d policy %d ioUnit %d)\n", round, buffer, policy, ioUnit); return 1; }
+      if (failures) { printf("stopped at round %d (compaction %d buffer %d policy %d ioUnit %d)\n", round, compaction, buffer, policy, ioUnit); return 1; }
     }
-    printf("buffer %d policy %d ioUnit %d OK: steps=%d switch=%" PRIu64 " partial=%" PRIu64 " full=%" PRIu64 " victims=%" PRIu64 " rwSectors=%zu buffered=%zu\n", buffer, policy, ioUnit, step, f.stat.switchMerge, f.stat.partialMerge, f.stat.fullMerge, f.stat.rwVictims, f.rwMap.size(), f.wbuf.size());
+    printf("compaction %d buffer %d policy %d ioUnit %d OK: steps=%d switch=%" PRIu64 " partial=%" PRIu64 " full=%" PRIu64 " victims=%" PRIu64 " compactions=%" PRIu64 " compactCopies=%" PRIu64 " fallbacks=%" PRIu64 " rwSectors=%zu buffered=%zu\n", compaction, buffer, policy, ioUnit, step, f.stat.switchMerge, f.stat.partialMerge, f.stat.fullMerge, f.stat.rwVictims, f.stat.rwCompactions, f.stat.rwCompactionCopies, f.stat.rwCompactionFallbacks, f.rwMap.size(), f.wbuf.size());
   }
   return failures ? 1 : 0;
 }

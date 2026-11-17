@@ -55,6 +55,7 @@ FAST::FAST(ConfigReader &c, Parameter &p, PAL::PAL *l, DRAM::AbstractDRAM *d)
   rwChip = 0;
   bufferedInReq = 0;
   useWriteBuffer = conf.readUint(CONFIG_FTL, FTL_FAST_WRITE_BUFFER) == 1;
+  useRWCompaction = conf.readUint(CONFIG_FTL, FTL_FAST_RW_COMPACTION) == 1;
 
   // 열린 RW 로그 슬롯은 chip 수와 RW 로그 한도 중 작은 값만큼 둔다
   nOpenSlots = MIN(param.pageCountToMaxPerf, maxRWLogs);
@@ -892,10 +893,123 @@ void FAST::verifyRWVictim(std::list<uint32_t>::iterator sel) {
 }
 #endif
 
+// 최신 sector만 새 RW 로그로 옮겨 무효 칸을 회수한다.
+// 기존 여유 블록 1개를 임시로 사용하고, 원본 erase 후 같은 로그 자리를 교체한다.
+bool FAST::tryCompactRW(std::list<uint32_t>::iterator victimIter,
+                        uint32_t requiredLane, uint32_t &replacement) {
+  const uint32_t victim = *victimIter;
+  std::vector<uint64_t> keys;
+  std::vector<SectorLoc> sources;
+  std::vector<uint64_t> lbns;
+  std::vector<uint32_t> validPerLane(param.ioUnitInPage, 0);
+  uint64_t written = 0;
+  uint64_t valid = 0;
+
+  // 원본의 물리 순서로 모아 복사 순서와 결과가 실행마다 같게 한다.
+  Bitset bit(param.ioUnitInPage);
+  std::vector<uint64_t> values;
+  for (uint32_t page = 0; page < param.pagesInBlock; page++) {
+    if (!blocks.at(victim).getPageInfo(page, values, bit)) {
+      continue;
+    }
+    for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
+      if (!bit.test(lane)) {
+        continue;
+      }
+      uint64_t key = values.at(lane);
+      auto loc = rwMap.find(key);
+      if (loc == rwMap.end() || loc->second.pbn != victim ||
+          loc->second.page != page || loc->second.lane != lane) {
+        panic("ftl: RW compaction source mapping mismatch");
+      }
+      // 같은 최신 버전을 반복 이동시키는 대신 full merge 한다.
+      if (loc->second.relocated) {
+        return false;
+      }
+      keys.push_back(key);
+      sources.push_back(loc->second);
+      validPerLane.at(key % param.ioUnitInPage)++;
+      lbns.push_back(key / param.ioUnitInPage / param.pagesInBlock);
+    }
+  }
+
+  if (keys.empty()) {
+    return false;  // 빈 로그는 scratch 없이 기존 경로에서 erase 한다.
+  }
+  if (!useWriteBuffer && requiredLane < param.ioUnitInPage) {
+    written = blocks.at(victim).getNextWritePageIndex(requiredLane);
+    valid = validPerLane.at(requiredLane);
+    if (valid >= param.pagesInBlock) {
+      return false;  // 지금 요청한 lane에 실제 쓰기 공간이 생겨야 한다.
+    }
+  }
+  else {
+    for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
+      written += blocks.at(victim).getNextWritePageIndex(lane);
+    }
+    valid = keys.size();
+  }
+  if (written <= valid) {
+    return false;
+  }
+
+  std::sort(lbns.begin(), lbns.end());
+  lbns.erase(std::unique(lbns.begin(), lbns.end()), lbns.end());
+  uint64_t mergeCopies = 0;
+  for (auto lbn : lbns) {
+    for (uint32_t page = 0; page < param.pagesInBlock; page++) {
+      uint64_t lpn = lbn * param.pagesInBlock + page;
+      for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
+        uint32_t pbn, offset, physLane;
+        // DRAM 버퍼에만 있는 최신 버전은 full merge도 복사하지 않는다.
+        if (findLatest(lpn, lane, pbn, offset, physLane)) {
+          mergeCopies++;
+        }
+      }
+    }
+  }
+  // 복사량/회수 공간이 full merge보다 작을 때만 압축한다.
+  // OFF 모드는 현재 요청한 lane, ON 모드는 전체 lane의 공간을 비교한다.
+  if ((uint64_t)keys.size() * written >= mergeCopies * (written - valid)) {
+    return false;
+  }
+
+  // 같은 호스트 요청 앞부분에서 발생한 NAND 쓰기부터 완료시킨다.
+  flushBatch();
+  replacement = getFreeBlockOnChip(victim % param.pageCountToMaxPerf);
+
+  for (size_t i = 0; i < keys.size(); i++) {
+    uint32_t lane = keys[i] % param.ioUnitInPage;
+    if (useWriteBuffer) {
+      // 채널들에 균등하게 채워 다음 버퍼 flush도 이어 쓸 수 있게 한다.
+      lane = i % param.ioUnitInPage;
+    }
+    uint32_t page = blocks.at(replacement).getNextWritePageIndex(lane);
+    if (bSendToPAL) {
+      queueOp(batch.reads, batch.readIndex, sources[i].pbn, sources[i].page,
+              sources[i].lane);
+      stat.sectorCopies++;
+    }
+    writeSector(replacement, page, keys[i], lane);
+    blocks.at(victim).invalidate(sources[i].page, sources[i].lane);
+    rwMap[keys[i]] = {replacement, page, lane, true};
+  }
+  // 새 로그의 program 완료 이후에만 원본을 erase 한다.
+  flushBatch();
+  rwLogs.erase(victimIter);
+  rwLogs.push_back(replacement);
+  eraseBlock(victim);
+  flushBatch();
+  stat.rwCompactions++;
+  stat.rwCompactionCopies += keys.size();
+  return true;
+}
+
 // 정책이 고른 RW 로그 블록을 victim으로 비운다.
+// 압축 옵션이 켜져 있으면 로그 간 이동을 먼저 평가하고, 불리하면
 // victim에 유효 sector를 가진 모든 논리 블록을 각각 full merge 한다.
 // 여러 논리 블록의 merge 요청을 하나의 batch로 모아 채널/chip 병렬성을 쓴다.
-void FAST::mergeRWVictim() {
+int64_t FAST::mergeRWVictim(uint32_t requiredLane) {
   auto victimIter = selectRWVictim();
 #ifdef FAST_VERIFY_VICTIM
   verifyRWVictim(victimIter);
@@ -905,6 +1019,21 @@ void FAST::mergeRWVictim() {
   }
 
   uint32_t victim = *victimIter;
+  if (useRWCompaction) {
+    uint32_t replacement;
+    if (tryCompactRW(victimIter, requiredLane, replacement)) {
+      stat.rwVictims++;
+      if (bSendToPAL) {
+        batch.doneTick +=
+            applyLatency(CPU::FTL__PAGE_MAPPING, CPU::DO_GARBAGE_COLLECTION);
+        batch.beginTick = batch.doneTick;
+      }
+      return replacement;
+    }
+    if (blocks.at(victim).getValidPageCountRaw() > 0) {
+      stat.rwCompactionFallbacks++;
+    }
+  }
   std::vector<uint64_t> unique;
   std::vector<uint64_t> lpns;
   Bitset bit(param.ioUnitInPage);
@@ -945,10 +1074,11 @@ void FAST::mergeRWVictim() {
   }
 
   flushBatch();
+  return -1;
 }
 
 // RW 로그에 쓴다. 해당 lane에 빈 칸이 있는 가장 오래된 블록을 쓰고, 없으면 새
-// 블록을 받는다. RW 로그가 한도만큼 있으면 가장 앞 블록을 먼저 merge 한다.
+// 블록을 받는다. RW 로그가 한도만큼 있으면 선택 정책에 따라 공간을 회수한다.
 void FAST::writeToRW(uint64_t lpn, uint32_t lane) {
   uint32_t target = 0;
   bool found = false;
@@ -963,13 +1093,18 @@ void FAST::writeToRW(uint64_t lpn, uint32_t lane) {
   }
 
   if (!found) {
+    int64_t replacement = -1;
     if (rwLogs.size() >= maxRWLogs) {
-      mergeRWVictim();
+      replacement = mergeRWVictim(lane);
     }
 
-    rwLogs.push_back(getFreeBlock());
-
-    target = rwLogs.back();
+    if (replacement >= 0) {
+      target = (uint32_t)replacement;
+    }
+    else {
+      rwLogs.push_back(getFreeBlock());
+      target = rwLogs.back();
+    }
   }
 
   uint32_t page = blocks.at(target).getNextWritePageIndex(lane);
@@ -978,7 +1113,7 @@ void FAST::writeToRW(uint64_t lpn, uint32_t lane) {
   invalidateLatest(lpn, lane);
   writeSector(target, page, key, lane);
 
-  rwMap[key] = {target, page, lane};
+  rwMap[key] = {target, page, lane, false};
 }
 
 // RW 로그로 가는 쓰기: 쓰기 버퍼를 쓰면 버퍼에 넣고, 아니면 바로 RW 로그에 쓴다
@@ -1080,7 +1215,11 @@ uint32_t FAST::ensureOpenRW(uint32_t slot) {
   openRW.at(slot) = -1;
 
   if (rwLogs.size() >= maxRWLogs) {
-    mergeRWVictim();
+    int64_t replacement = mergeRWVictim();
+    if (replacement >= 0) {
+      openRW.at(slot) = replacement;
+      return (uint32_t)replacement;
+    }
   }
 
   uint32_t pbn = getFreeBlockOnChip(slot % param.pageCountToMaxPerf);
@@ -1130,7 +1269,7 @@ void FAST::flushWriteBuffer() {
     // NAND의 이전 버전은 버퍼에 넣을 때 이미 무효화했다
     writeSector(target, page, key, physLane);
 
-    rwMap[key] = {target, page, physLane};
+    rwMap[key] = {target, page, physLane, false};
 
     if (flushOps.empty() || flushOps.back().pbn != target ||
         flushOps.back().page != page) {
@@ -1495,6 +1634,18 @@ void FAST::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.desc = "NAND write requests issued by buffer flush (== flushes if each "
               "flush is one superpage)";
   list.push_back(temp);
+
+  temp.name = prefix + "fast.rw.compactions";
+  temp.desc = "RW logs reclaimed by relocating only their latest sectors";
+  list.push_back(temp);
+
+  temp.name = prefix + "fast.rw.compaction_copies";
+  temp.desc = "Sectors relocated between RW logs (included in sector_copies)";
+  list.push_back(temp);
+
+  temp.name = prefix + "fast.rw.compaction_fallbacks";
+  temp.desc = "Nonempty RW victims using full merge instead of compaction";
+  list.push_back(temp);
 }
 
 void FAST::getStatValues(std::vector<double> &values) {
@@ -1530,6 +1681,9 @@ void FAST::getStatValues(std::vector<double> &values) {
   values.push_back(stat.bufferFlushes);
   values.push_back(stat.bufferAbsorbed);
   values.push_back(stat.bufferWriteOps);
+  values.push_back(stat.rwCompactions);
+  values.push_back(stat.rwCompactionCopies);
+  values.push_back(stat.rwCompactionFallbacks);
 }
 
 void FAST::resetStatValues() {

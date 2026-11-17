@@ -76,6 +76,7 @@ class FAST : public AbstractFTL {
   std::list<uint32_t> rwLogs;
   uint32_t maxRWLogs;
   uint32_t rwGCPolicy;  // RW 로그 victim 선택 방식 (0: FIFO, 1: greedy)
+  bool useRWCompaction;
 
   // RW 로그에서 sector가 실제로 놓인 위치. 쓰기 버퍼를 쓰면 sector가 논리 lane과
   // 다른 lane(채널)에 놓일 수 있으므로 실제 lane도 함께 기록한다.
@@ -83,6 +84,7 @@ class FAST : public AbstractFTL {
     uint32_t pbn;
     uint32_t page;
     uint32_t lane;  // 실제로 쓴 lane (SuperblockSize = C이면 채널 번호)
+    bool relocated;  // 같은 최신 버전은 한 번만 RW 로그 간 이동한다
   };
 
   // RW 로그의 섹터 매핑 테이블 (sector 키 = lpn * lane 수 + 논리 lane -> 위치).
@@ -145,6 +147,9 @@ class FAST : public AbstractFTL {
     uint64_t bufferFlushes;   // 쓰기 버퍼 flush 횟수
     uint64_t bufferAbsorbed;  // 버퍼 안에서 덮어써져 NAND에 쓰지 않은 sector 수
     uint64_t bufferWriteOps;  // flush가 발행한 NAND 쓰기 요청 수 (정상이면 flush 수와 같다)
+    uint64_t rwCompactions;
+    uint64_t rwCompactionCopies;
+    uint64_t rwCompactionFallbacks;
   } stat;
 
   // 채널(lane)별, chip별 NAND write/erase 횟수.
@@ -199,7 +204,9 @@ class FAST : public AbstractFTL {
   uint64_t verifiedVictims = 0;  // 검사를 통과한 victim 선택 횟수
   void verifyRWVictim(std::list<uint32_t>::iterator);
 #endif
-  void mergeRWVictim();
+  bool tryCompactRW(std::list<uint32_t>::iterator, uint32_t, uint32_t &);
+  // 압축한 대체 로그 번호, 또는 full merge/빈 로그 회수이면 -1을 반환한다.
+  int64_t mergeRWVictim(uint32_t requiredLane = UINT32_MAX);
 
   void readInternal(Request &, uint64_t &);
   void writeInternal(Request &, uint64_t &);

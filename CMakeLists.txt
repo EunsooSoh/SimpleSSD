@@ -97,6 +97,7 @@ set(SRC_FTL_COMMON
 set(SRC_FTL
   ftl/config.cc
   ftl/fast.cc
+  ftl/merge_cost_fast.cc
   ftl/ftl.cc
   ftl/page_mapping.cc
 )
@@ -202,6 +203,8 @@ target_link_libraries(simplessd mcpat)
 option(BUILD_TESTS "Build SimpleSSD unit tests." OFF)
 
 if (BUILD_TESTS)
+  add_executable(test_merge_cost_fast test/ftl/test_merge_cost_fast.cc)
+  target_link_libraries(test_merge_cost_fast simplessd)
   add_executable(test_fast test/ftl/test_fast.cc)
   target_link_libraries(test_fast simplessd)
 endif ()

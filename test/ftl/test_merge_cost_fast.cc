@@ -1,0 +1,323 @@
+/*
+ * MergeCostFAST FTL 내부 상태 정합성 테스트
+ *
+ * 무작위 lane 쓰기, lane/페이지 순차 쓰기, trim, format을 섞어 실행하면서 매 단계마다
+ * 아래 불변식을 검사한다.
+ *  - 모든 (lpn, lane)의 최신 위치가 모델과 일치하고, 그 위치의 블록이 같은 lpn을 가진다
+ *  - 블록들의 유효 sector 수 합 == 매핑된 sector 수
+ *  - 사용 중인 블록은 데이터/SW/RW 로그 중 하나이다 (블록 누수 없음)
+ *  - RW 로그 수가 FASTRWLogBlocks를 넘지 않는다
+ *  - (쓰기 버퍼) 매핑된 sector는 NAND 최신 위치와 버퍼 중 정확히 한 곳에만 있다
+ *  - (쓰기 버퍼) 버퍼는 lane 수보다 작고, 열린 RW 로그가 아닌 RW 로그는 모든 lane이 꽉 찼다
+ *
+ * 내부 멤버에 접근하기 위해 헤더를 포함하기 전에 private을 public으로 바꾼다.
+ * PAL/DRAM 없이 상태만 검사하므로 bSendToPAL을 false로 두고 동작시킨다.
+ *
+ * 사용법: test_merge_cost_fast <SimpleSSD 설정 파일>   (예: config/sample.cfg)
+ * 빌드:   cmake -DBUILD_TESTS=ON ... 후 make test_merge_cost_fast
+ */
+
+// MergeCostFAST 내부 상태 정합성 검증용 테스트 (private 접근을 열어 두고 불변식을 검사한다)
+#include <algorithm>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <list>
+#include <map>
+#include <memory>
+#include <random>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include "ftl/abstract_ftl.hh"
+#include "ftl/common/block.hh"
+#include "ftl/ftl.hh"
+#include "pal/pal.hh"
+#include "sim/config_reader.hh"
+#define private public
+#include "ftl/merge_cost_fast.hh"
+#include "ftl/fast.hh"
+#undef private
+
+using namespace SimpleSSD;
+using namespace SimpleSSD::FTL;
+
+static int failures = 0;
+#define CHECK(c, ...) do { if (!(c)) { printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); failures++; if (failures > 20) exit(1);} } while (0)
+
+static void verify(MergeCostFAST &f, Parameter &p, std::set<uint64_t> &model, const char *when, int step) {
+  uint32_t U = p.ioUnitInPage;
+  CHECK(f.mappedSectors == model.size(), "[%s %d] mappedSectors %" PRIu64 " != model %zu", when, step, f.mappedSectors, model.size());
+  uint64_t sum = 0;
+  for (auto &e : f.mappedLanes) sum += e.second;
+  CHECK(sum == model.size(), "[%s %d] mappedLanes sum %" PRIu64 " != %zu", when, step, sum, model.size());
+  uint64_t total = p.totalLogicalBlocks * p.pagesInBlock;
+  for (uint64_t lpn = 0; lpn < total; lpn++) {
+    for (uint32_t lane = 0; lane < U; lane++) {
+      uint64_t key = lpn * U + lane;
+      uint32_t pbn, page, physLane;
+      bool found = f.findLatest(lpn, lane, pbn, page, physLane);
+      bool buffered = f.inBuffer(key);
+      bool expect = model.count(key) > 0;
+      // NAND와 버퍼 중 정확히 한 곳에만 있어야 한다
+      CHECK(!(found && buffered), "[%s %d] lpn %" PRIu64 " lane %u in both NAND and buffer", when, step, lpn, lane);
+      CHECK((found || buffered) == expect, "[%s %d] lpn %" PRIu64 " lane %u found=%d buffered=%d model=%d", when, step, lpn, lane, found, buffered, expect);
+      if (found) {
+        Bitset bit(U);
+        std::vector<uint64_t> lpns;
+        bool v = f.blocks.at(pbn).getPageInfo(page, lpns, bit);
+        // RW 로그 칸에는 sector 키가, 데이터 블록/SW 로그 칸에는 lpn이 있다
+        bool isRW = f.rwMap.count(key) > 0;
+        uint64_t stored = isRW ? key : lpn;
+        CHECK(isRW || physLane == lane, "[%s %d] lpn %" PRIu64 " lane %u moved lane outside rw log", when, step, lpn, lane);
+        CHECK(v && bit.test(physLane) && lpns.at(physLane) == stored, "[%s %d] lpn %" PRIu64 " lane %u location invalid", when, step, lpn, lane);
+      }
+    }
+  }
+  uint64_t valid = 0;
+  for (auto &b : f.blocks) valid += b.second.getValidPageCountRaw();
+  CHECK(valid + f.wbuf.size() == model.size(), "[%s %d] valid sectors %" PRIu64 " + buffer %zu != %zu", when, step, valid, f.wbuf.size(), model.size());
+  CHECK(f.wbuf.size() == f.wbufIndex.size(), "[%s %d] buffer index size mismatch", when, step);
+  for (size_t i = 0; i < f.wbuf.size(); i++) {
+    CHECK(f.wbufIndex.at(f.wbuf[i]) == i, "[%s %d] buffer index mismatch", when, step);
+  }
+  if (f.useWriteBuffer) {
+    CHECK(f.wbuf.size() < U, "[%s %d] buffer not flushed (%zu)", when, step, f.wbuf.size());
+    // 4번: 열린 RW 로그가 아닌 RW 로그(= victim 후보)는 모든 lane이 꽉 차 있어야 한다
+    for (auto pbn : f.rwLogs) {
+      CHECK(f.isOpenRW(pbn) || f.isRWFull(pbn), "[%s %d] closed rw log %u is not full", when, step, pbn);
+    }
+    for (auto o : f.openRW) {
+      CHECK(o < 0 || std::find(f.rwLogs.begin(), f.rwLogs.end(), (uint32_t)o) != f.rwLogs.end(), "[%s %d] open rw log outside rw logs", when, step);
+    }
+  } else {
+    CHECK(f.wbuf.empty(), "[%s %d] buffer used while disabled", when, step);
+  }
+  // 블록 누수 검사: 사용 중인 블록은 데이터/SW/RW 로그 중 하나여야 한다
+  size_t used = f.dataBlockMap.size() + (f.sw.valid ? 1 : 0) + f.rwLogs.size();
+  CHECK(f.blocks.size() == used, "[%s %d] blocks %zu != referenced %zu (leak)", when, step, f.blocks.size(), used);
+  CHECK(f.blocks.size() + f.nFreeBlocks == p.totalPhysicalBlocks, "[%s %d] block count mismatch", when, step);
+  CHECK(f.nFreeBlocks == f.freeBlocks.size(), "[%s %d] nFreeBlocks mismatch", when, step);
+  for (auto &e : f.rwMap) {
+    CHECK(std::find(f.rwLogs.begin(), f.rwLogs.end(), e.second.pbn) != f.rwLogs.end(), "[%s %d] rwMap points outside rw logs", when, step);
+  }
+  CHECK(f.rwLogs.size() <= f.maxRWLogs, "[%s %d] too many rw logs", when, step);
+
+  // victim 선택 검사: selectRWVictim()은 상태를 바꾸지 않으므로 매 단계 호출해 볼 수 있다.
+  // 블록의 유효 sector 수는 Block이 아니라 rwMap에서 따로 세어 서로 대조한다.
+  if (!f.rwLogs.empty()) {
+    std::map<uint32_t, uint32_t> validByMap;
+    for (auto &e : f.rwMap) validByMap[e.second.pbn]++;
+    for (auto pbn : f.rwLogs) {
+      CHECK(f.blocks.at(pbn).getValidPageCountRaw() == validByMap[pbn], "[%s %d] rw log %u valid count mismatch (block %u, rwMap %u)", when, step, pbn, f.blocks.at(pbn).getValidPageCountRaw(), validByMap[pbn]);
+    }
+    auto sel = f.selectRWVictim();
+    // 열린 RW 로그는 후보가 아니므로, 후보가 하나도 없을 때만 end가 나올 수 있다
+    bool anyClosed = false;
+    for (auto pbn : f.rwLogs) if (!f.isOpenRW(pbn)) anyClosed = true;
+    CHECK((sel != f.rwLogs.end()) == anyClosed, "[%s %d] selectRWVictim end mismatch", when, step);
+    if (sel != f.rwLogs.end()) {
+      CHECK(!f.isOpenRW(*sel), "[%s %d] victim is an open rw log", when, step);
+      if (f.rwGCPolicy == 0) {
+        auto first = f.rwLogs.begin();
+        while (f.isOpenRW(*first)) ++first;
+        CHECK(sel == first, "[%s %d] FIFO did not pick the oldest closed rw log", when, step);
+      } else {
+        // greedy: 유효 sector 수가 최소이고, 최소가 여러 개면 가장 앞(오래된) 블록
+        long double minValid = 1e100L;
+        auto expect = f.rwLogs.begin();
+        for(auto it=f.rwLogs.begin();it!=f.rwLogs.end();++it) {
+          if(f.isOpenRW(*it)) continue;
+          std::set<uint64_t> affected;
+          for(const auto &entry:f.rwMap) if(entry.second.pbn==*it) affected.insert(entry.first/U/p.pagesInBlock);
+          uint64_t copies=0,space=0;
+          for(uint32_t l=0;l<U;++l) space+=f.blocks.at(*it).getNextWritePageIndex(l);
+          if(!space) continue;
+          for(uint64_t lp=0;lp<total;++lp) if(affected.count(lp/p.pagesInBlock)) for(uint32_t l=0;l<U;++l) {
+            uint32_t b,pg,ph;if(f.findLatest(lp,l,b,pg,ph)) ++copies;
+          }
+          long double score=(long double)copies/space;
+          if(score<minValid) {minValid=score;expect=it;}
+        }
+        CHECK(sel == expect, "[%s %d] cost victim %u (valid %u), expected %u (score %Lf)", when, step, *sel, validByMap[*sel], *expect, minValid);
+      }
+    }
+  }
+}
+
+// 설정 파일을 읽어 FASTRWLogBlocks만 작은 값으로 바꾸고 FASTRWGCPolicy를 지정한
+// 임시 설정 파일을 만든다 (RW 로그가 자주 가득 차서 merge 경로가 많이 실행되게 하기 위함)
+static std::string makeTestConfig(const char *path, int policy, int buffer) {
+  std::ifstream in(path);
+  std::string tmp = "test_merge_cost_fast.tmp.cfg";
+  std::ofstream out(tmp);
+  std::string line;
+  bool replaced = false;
+  bool policyReplaced = false;
+  bool bufferReplaced = false;
+
+  if (!in.is_open()) {
+    printf("설정 파일을 열 수 없습니다: %s\n", path);
+    exit(2);
+  }
+
+  while (std::getline(in, line)) {
+    if (line.compare(0, 15, "FASTRWLogBlocks") == 0) {
+      line = "FASTRWLogBlocks = 3";
+      replaced = true;
+    }
+    else if (line.compare(0, 14, "FASTRWGCPolicy") == 0) {
+      line = "FASTRWGCPolicy = " + std::to_string(policy);
+      policyReplaced = true;
+    }
+    else if (line.compare(0, 15, "FASTWriteBuffer") == 0) {
+      line = "FASTWriteBuffer = " + std::to_string(buffer);
+      bufferReplaced = true;
+    }
+
+    out << line << "\n";
+  }
+
+  if (!replaced) {
+    printf("설정 파일에 FASTRWLogBlocks가 없습니다\n");
+    exit(2);
+  }
+
+  if (!policyReplaced) {
+    printf("설정 파일에 FASTRWGCPolicy가 없습니다\n");
+    exit(2);
+  }
+
+  if (!bufferReplaced) {
+    printf("설정 파일에 FASTWriteBuffer가 없습니다\n");
+    exit(2);
+  }
+
+  return tmp;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2) {
+    printf("사용법: %s <SimpleSSD 설정 파일>\n", argv[0]);
+    return 2;
+  }
+
+  Parameter p;
+  p.totalPhysicalBlocks = 60;
+  p.totalLogicalBlocks = 30;
+  p.pagesInBlock = 8;
+  p.pageSize = 4096 * 4;
+  p.ioUnitInPage = 4;
+  p.pageCountToMaxPerf = 4;
+
+  // RW 로그 victim 정책(0: FIFO, 1: greedy) × ioUnit × 쓰기 버퍼(0, 1)를 모두 검사한다
+  for (int buffer : {0})
+  for (int policy : {1})
+  for (int ioUnit : {1, 2, 4, 8}) {
+    std::string cfg = makeTestConfig(argv[1], policy, buffer);
+    ConfigReader conf;
+    conf.init(cfg);
+    std::remove(cfg.c_str());
+    p.ioUnitInPage = ioUnit;
+    {
+      FAST original(conf, p, nullptr, nullptr);
+      MergeCostFAST candidate(conf, p, nullptr, nullptr);
+
+      original.initialize(); candidate.initialize();
+      CHECK(original.dataBlockMap == candidate.dataBlockMap, "initial data map mismatch");
+      CHECK(original.mappedLanes == candidate.mappedLanes, "initial mapped lanes mismatch");
+      CHECK(original.rwLogs == candidate.rwLogs, "initial RW list mismatch");
+      CHECK(original.nFreeBlocks == candidate.nFreeBlocks, "initial free blocks mismatch");
+      CHECK(original.sw.valid == candidate.sw.valid && original.sw.pbn == candidate.sw.pbn && original.sw.lbn == candidate.sw.lbn && original.swNext == candidate.swNext, "initial SW mismatch");
+      CHECK(candidate.costRuntime, "warm-up must not apply optimization");
+      auto a = original.freeBlocks.begin(), b = candidate.freeBlocks.begin();
+      for (; a != original.freeBlocks.end() && b != candidate.freeBlocks.end(); ++a, ++b) CHECK(a->getBlockIndex() == b->getBlockIndex(), "initial free list order mismatch");
+      for (uint64_t lpn = 0; lpn < p.totalLogicalBlocks * p.pagesInBlock; ++lpn) {
+        for (uint32_t lane = 0; lane < p.ioUnitInPage; ++lane) {
+          uint32_t ap = 0, ai = 0, al = 0, bp = 0, bi = 0, bl = 0;
+          bool av = original.findLatest(lpn, lane, ap, ai, al);
+          bool bv = candidate.findLatest(lpn, lane, bp, bi, bl);
+          CHECK(av == bv && (!av || (ap == bp && ai == bi && al == bl)), "initial latest location mismatch");
+        }
+      }
+      for (auto &entry : original.blocks)
+        for (uint32_t lane = 0; lane < p.ioUnitInPage; ++lane)
+          CHECK(entry.second.getNextWritePageIndex(lane) == candidate.blocks.at(entry.first).getNextWritePageIndex(lane), "initial pointer mismatch");
+    }
+    MergeCostFAST f(conf, p, nullptr, nullptr);
+    f.bSendToPAL = false;
+
+    std::set<uint64_t> model;
+    std::mt19937_64 rng(1234 + ioUnit);
+    uint64_t total = p.totalLogicalBlocks * p.pagesInBlock;
+    Request req(p.ioUnitInPage);
+    req.ioFlag.set();
+    uint64_t tick = 0;
+    int step = 0;
+    auto addModel = [&](uint64_t lpn, Bitset &flag) {
+      for (uint32_t l = 0; l < p.ioUnitInPage; l++) if (flag.test(l)) model.insert(lpn * p.ioUnitInPage + l);
+    };
+    for (int round = 0; round < 400; round++) {
+      int kind = rng() % 12;
+      if (kind < 3) {
+        // lane 단위 순차 쓰기: 페이지 순서로 lane을 하나씩 보낸다 (ICL이 보내는 패턴)
+        uint64_t lbn = rng() % p.totalLogicalBlocks;
+        uint32_t start = rng() % 3 == 0 ? rng() % p.pagesInBlock : 0;
+        uint32_t len = 1 + rng() % (p.pagesInBlock - start);
+        for (uint32_t o = start; o < start + len; o++) {
+          for (uint32_t l = 0; l < p.ioUnitInPage; l++) {
+            req.lpn = lbn * p.pagesInBlock + o;
+            req.ioFlag.reset();
+            req.ioFlag.set(l);
+            f.writeInternal(req, tick);
+            addModel(req.lpn, req.ioFlag);
+            verify(f, p, model, "laneseq", step++);
+          }
+        }
+      } else if (kind < 5) {
+        // 페이지 전체 순차 쓰기
+        uint64_t lbn = rng() % p.totalLogicalBlocks;
+        for (uint32_t o = 0; o < p.pagesInBlock; o++) {
+          req.lpn = lbn * p.pagesInBlock + o;
+          req.ioFlag.set();
+          f.writeInternal(req, tick);
+          addModel(req.lpn, req.ioFlag);
+          verify(f, p, model, "pageseq", step++);
+        }
+      } else if (kind < 10) {
+        // 무작위 lpn, 무작위 lane 부분집합
+        req.lpn = rng() % total;
+        req.ioFlag.reset();
+        while (req.ioFlag.none()) {
+          for (uint32_t l = 0; l < p.ioUnitInPage; l++) if (rng() % 2) req.ioFlag.set(l);
+        }
+        f.writeInternal(req, tick);
+        addModel(req.lpn, req.ioFlag);
+        verify(f, p, model, "rand", step++);
+      } else if (kind < 11) {
+        req.lpn = rng() % total;
+        f.trimInternal(req, tick);
+        for (uint32_t l = 0; l < p.ioUnitInPage; l++) model.erase(req.lpn * p.ioUnitInPage + l);
+        verify(f, p, model, "trim", step++);
+      } else {
+        LPNRange range;
+        range.slpn = rng() % total;
+        range.nlp = 1 + rng() % 20;
+        if (range.slpn + range.nlp > total) range.nlp = total - range.slpn;
+        f.format(range, tick);
+        for (uint64_t lp = range.slpn; lp < range.slpn + range.nlp; lp++)
+          for (uint32_t l = 0; l < p.ioUnitInPage; l++) model.erase(lp * p.ioUnitInPage + l);
+        verify(f, p, model, "format", step++);
+      }
+      if (failures) { printf("stopped at round %d (buffer %d policy %d ioUnit %d)\n", round, buffer, policy, ioUnit); return 1; }
+    }
+
+
+    printf("buffer %d policy %d ioUnit %d OK: steps=%d switch=%" PRIu64 " partial=%" PRIu64 " full=%" PRIu64 " victims=%" PRIu64 " rwSectors=%zu buffered=%zu\n", buffer, policy, ioUnit, step, f.stat.switchMerge, f.stat.partialMerge, f.stat.fullMerge, f.stat.rwVictims, f.rwMap.size(), f.wbuf.size());
+  }
+  return failures ? 1 : 0;
+}

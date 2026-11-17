@@ -55,6 +55,7 @@ typedef enum {
 typedef enum {
   PAGE_MAPPING,
   FAST_MAPPING,
+  MERGE_COST_FAST_MAPPING = 18,
 } MAPPING;
 
 typedef enum {

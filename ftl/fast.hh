@@ -75,8 +75,9 @@ class FAST : public AbstractFTL {
   // RW(랜덤 쓰기) 로그 블록: 가장 앞이 가장 오래된 블록(victim 후보)
   std::list<uint32_t> rwLogs;
   uint32_t maxRWLogs;
-  uint32_t rwGCPolicy;  // RW 로그 victim 선택 방식 (0: FIFO, 1: greedy)
+  uint32_t rwGCPolicy;  // 0: FIFO, 1: greedy, 2: 복사량/회수 공간
   bool useRWCompaction;
+  uint64_t warmupStateHash();  // 실험 시작 시 배치와 쓰기 위치를 비교하는 지문
 
   // RW 로그에서 sector가 실제로 놓인 위치. 쓰기 버퍼를 쓰면 sector가 논리 lane과
   // 다른 lane(채널)에 놓일 수 있으므로 실제 lane도 함께 기록한다.
@@ -150,6 +151,14 @@ class FAST : public AbstractFTL {
     uint64_t rwCompactions;
     uint64_t rwCompactionCopies;
     uint64_t rwCompactionFallbacks;
+    uint64_t rwCostSelections;
+    uint64_t rwCostDifferentFromGreedy;
+    // Synchronous reclaim-call elapsed time, in simulated ps; excludes warmup.
+    // Paths: SW merge, RW full/empty reclaim, RW relocation. A call may drain
+    // pending host NAND operations, so this is not GC-only NAND service time.
+    uint64_t gcEvents[3];
+    uint64_t gcWaitPs[3];
+    uint64_t gcMaxWaitPs[3];
   } stat;
 
   // 채널(lane)별, chip별 NAND write/erase 횟수.
@@ -198,11 +207,24 @@ class FAST : public AbstractFTL {
   void startSW(uint64_t);
   void appendSW(uint64_t, uint32_t);
   void mergeSW();
+  void recordGCWait(uint64_t, uint32_t);
   void mergeLbn(uint64_t);
-  std::list<uint32_t>::iterator selectRWVictim();
+  struct RWReclaimCost {
+    uint64_t mergeCopies;
+    uint64_t validSectors;
+    uint64_t fullSpace;
+    uint64_t compactSpace;
+    bool compact;
+    uint64_t copies() const { return compact ? validSectors : mergeCopies; }
+    uint64_t space() const { return compact ? compactSpace : fullSpace; }
+  };
+  RWReclaimCost estimateRWCost(uint32_t, uint32_t,
+      std::unordered_map<uint64_t, uint64_t> * = nullptr);
+  static bool lowerRWCost(uint64_t, uint64_t, uint64_t, uint64_t);
+  std::list<uint32_t>::iterator selectRWVictim(uint32_t requiredLane = UINT32_MAX);
 #ifdef FAST_VERIFY_VICTIM
   uint64_t verifiedVictims = 0;  // 검사를 통과한 victim 선택 횟수
-  void verifyRWVictim(std::list<uint32_t>::iterator);
+  void verifyRWVictim(std::list<uint32_t>::iterator, uint32_t);
 #endif
   bool tryCompactRW(std::list<uint32_t>::iterator, uint32_t, uint32_t &);
   // 압축한 대체 로그 번호, 또는 full merge/빈 로그 회수이면 -1을 반환한다.

@@ -25,7 +25,9 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <random>
@@ -125,7 +127,7 @@ static void verify(FAST &f, Parameter &p, std::set<uint64_t> &model, const char 
         auto first = f.rwLogs.begin();
         while (f.isOpenRW(*first)) ++first;
         CHECK(sel == first, "[%s %d] FIFO did not pick the oldest closed rw log", when, step);
-      } else {
+      } else if (f.rwGCPolicy == 1) {
         // greedy: 유효 sector 수가 최소이고, 최소가 여러 개면 가장 앞(오래된) 블록
         uint32_t minValid = UINT32_MAX;
         auto expect = f.rwLogs.begin();
@@ -135,6 +137,36 @@ static void verify(FAST &f, Parameter &p, std::set<uint64_t> &model, const char 
           if (v < minValid) { minValid = v; expect = it; }
         }
         CHECK(sel == expect, "[%s %d] greedy picked %u (valid %u), expected %u (valid %u)", when, step, *sel, validByMap[*sel], *expect, minValid);
+      } else {
+        // Independent oracle: count NAND versions from logical mappings minus
+        // DRAM-only versions, rather than calling production findLatest/cost.
+        std::map<uint64_t, uint64_t> nandByLbn;
+        for (auto &e : f.mappedLanes) nandByLbn[e.first / p.pagesInBlock] += e.second;
+        for (auto key : f.wbuf) nandByLbn[key / U / p.pagesInBlock]--;
+        auto expect = f.rwLogs.end();
+        long double best = std::numeric_limits<long double>::infinity();
+        for (auto it = f.rwLogs.begin(); it != f.rwLogs.end(); ++it) {
+          if (f.isOpenRW(*it)) continue;
+          std::set<uint64_t> lbns;
+          bool moved = false;
+          uint64_t valid = 0, written = 0, copies = 0;
+          for (auto &e : f.rwMap) if (e.second.pbn == *it) {
+            lbns.insert(e.first / U / p.pagesInBlock);
+            moved |= e.second.relocated;
+            valid++;
+          }
+          for (uint32_t lane = 0; lane < U; lane++)
+            written += f.blocks.at(*it).getNextWritePageIndex(lane);
+          for (auto lbn : lbns) copies += nandByLbn[lbn];
+          long double score = written ? (long double)copies / written :
+                              std::numeric_limits<long double>::infinity();
+          if (f.useRWCompaction && !moved && valid > 0 && written > valid)
+            score = std::min(score, (long double)valid / (written - valid));
+          if (expect == f.rwLogs.end() || score < best - 1e-12L) {
+            expect = it; best = score;
+          }
+        }
+        CHECK(sel == expect, "[%s %d] cost selection differs from independent oracle", when, step);
       }
     }
   }
@@ -142,7 +174,7 @@ static void verify(FAST &f, Parameter &p, std::set<uint64_t> &model, const char 
 
 // 설정 파일을 읽어 FASTRWLogBlocks만 작은 값으로 바꾸고 FASTRWGCPolicy를 지정한
 // 임시 설정 파일을 만든다 (RW 로그가 자주 가득 차서 merge 경로가 많이 실행되게 하기 위함)
-static std::string makeTestConfig(const char *path, int policy, int buffer, int compaction) {
+static std::string makeTestConfig(const char *path, int policy, int buffer, int compaction, int common = 0) {
   std::ifstream in(path);
   std::string tmp = "test_fast.tmp.cfg";
   std::ofstream out(tmp);
@@ -159,6 +191,12 @@ static std::string makeTestConfig(const char *path, int policy, int buffer, int 
   while (std::getline(in, line)) {
     // 새 옵션이 없는 이전 설정 파일도 테스트할 수 있도록 버퍼 옵션 뒤에 삽입한다.
     if (line.compare(0, 16, "FASTRWCompaction") == 0) continue;
+    if (line.compare(0, 16, "FASTCommonWarmup") == 0) continue;
+    if (common) {
+      if (line.compare(0, 9, "FillRatio") == 0) line = "FillRatio = 0.9";
+      if (line.compare(0, 16, "InvalidPageRatio") == 0) line = "InvalidPageRatio = 0.3";
+      if (line.compare(0, 11, "FillingMode") == 0) line = "FillingMode = 1";
+    }
     if (line.compare(0, 15, "FASTRWLogBlocks") == 0) {
       line = "FASTRWLogBlocks = 3";
       replaced = true;
@@ -169,7 +207,8 @@ static std::string makeTestConfig(const char *path, int policy, int buffer, int 
     }
     else if (line.compare(0, 15, "FASTWriteBuffer") == 0) {
       line = "FASTWriteBuffer = " + std::to_string(buffer) +
-             "\nFASTRWCompaction = " + std::to_string(compaction);
+             "\nFASTRWCompaction = " + std::to_string(compaction) +
+             "\nFASTCommonWarmup = " + std::to_string(common);
       bufferReplaced = true;
     }
 
@@ -327,12 +366,158 @@ static void testRWCompaction(const char *path) {
   printf("RW compaction focused cases OK\n");
 }
 
+static void testCostVictim(const char *path) {
+  CHECK(FAST::lowerRWCost(1, 3, 1, 2), "rational order incorrect");
+  CHECK(!FAST::lowerRWCost(2, 4, 1, 2), "rational tie incorrect");
+  CHECK(FAST::lowerRWCost(UINT64_MAX - 1, UINT64_MAX, UINT64_MAX, UINT64_MAX - 1),
+        "rational comparison overflowed");
+  CHECK(!FAST::lowerRWCost(0, 0, 1, 2) && FAST::lowerRWCost(1, 2, 0, 0),
+        "zero-space candidate ordering incorrect");
+  for (int buffer : {0, 1})
+  for (int compact : {0, 1})
+  for (int sparse : {0, 1}) {
+    std::string cfg = makeTestConfig(path, 2, buffer, compact);
+    ConfigReader conf;
+    conf.init(cfg); std::remove(cfg.c_str());
+    Parameter p;
+    p.totalPhysicalBlocks = 60; p.totalLogicalBlocks = 30;
+    p.pagesInBlock = 8; p.ioUnitInPage = 1;
+    p.pageSize = 4096; p.pageCountToMaxPerf = 4;
+    FAST f(conf, p, nullptr, nullptr);
+    f.bSendToPAL = false;
+    std::set<uint64_t> model;
+    Request req(1); req.ioFlag.set();
+    uint64_t tick = 0;
+    for (uint64_t lpn = 0; lpn < 16; lpn++) {
+      if (sparse && lpn >= 8 && (lpn < 9 || lpn > 12)) continue;
+      req.lpn = lpn; f.writeInternal(req, tick); model.insert(lpn);
+    }
+    // A: 3 live sectors, full LBN cost 8. B: 4 live sectors,
+    // full LBN cost 4 (sparse) or 8 (dense). Both logs used 8 slots.
+    for (int i = 0; i < 8; i++) f.writeToRW(1 + i % 3, 0);
+    for (int i = 0; i < 8; i++) f.writeToRW(9 + i % 4, 0);
+    auto a = f.rwLogs.begin(); auto b = std::next(a);
+    f.rwGCPolicy = 1;
+    CHECK(f.selectRWVictim() == a, "fixture did not distinguish greedy");
+    f.rwGCPolicy = 2;
+    uint64_t before = f.warmupStateHash();
+    auto selected = f.selectRWVictim(0);
+    CHECK(selected == (sparse ? b : a), "cost policy chose wrong victim");
+    CHECK(f.warmupStateHash() == before, "candidate evaluation changed state");
+    auto costA = f.estimateRWCost(*a, 0), costB = f.estimateRWCost(*b, 0);
+    CHECK(costA.mergeCopies == 8 && costA.validSectors == 3 && costA.fullSpace == 8,
+          "A full merge estimate incorrect");
+    CHECK(costB.mergeCopies == (uint64_t)(sparse ? 4 : 8) && costB.validSectors == 4,
+          "B full merge estimate incorrect");
+    CHECK(!costB.compact, "equal/worse relocation should prefer full merge");
+    int64_t replacement = f.mergeRWVictim(0);
+    if (buffer && replacement >= 0) f.openRW[0] = replacement;
+    CHECK(f.stat.rwCostSelections == 1 && f.stat.rwCostDifferentFromGreedy == (uint64_t)sparse,
+          "cost-vs-greedy selection statistics incorrect");
+    verify(f, p, model, "cost-victim", sparse + compact + buffer);
+  }
+  printf("Cost victim: 8 focused cases and overflow/tie checks OK\n");
+}
+
+static void testCommonWarmup(const char *path) {
+  for (int buffer : {0, 1})
+  for (int policy : {0, 1, 2})
+  for (int lanes : {1, 4}) {
+    ConfigReader configs[2];
+    for (int c : {0, 1}) {
+      std::string cfg = makeTestConfig(path, policy, buffer, c, 1);
+      configs[c].init(cfg);
+      std::remove(cfg.c_str());
+    }
+    Parameter p;
+    p.totalPhysicalBlocks = 60; p.totalLogicalBlocks = 30;
+    p.pagesInBlock = 8; p.ioUnitInPage = lanes;
+    p.pageSize = 4096 * lanes; p.pageCountToMaxPerf = 4;
+    FAST baseline(configs[0], p, nullptr, nullptr);
+    FAST moving(configs[1], p, nullptr, nullptr);
+    baseline.initialize(); moving.initialize();
+    CHECK(baseline.warmupStateHash() == moving.warmupStateHash(),
+          "common warmup states differ: buffer %d policy %d lanes %d", buffer, policy, lanes);
+    CHECK(!baseline.useRWCompaction && moving.useRWCompaction,
+          "common warmup did not restore runtime compaction");
+    CHECK(baseline.rwGCPolicy == (uint32_t)policy && moving.rwGCPolicy == (uint32_t)policy,
+          "common warmup did not restore runtime victim policy");
+    std::set<uint64_t> model;
+    // Match the config reader's float arithmetic in FAST::initialize().
+    uint64_t filled = p.totalLogicalBlocks * p.pagesInBlock *
+                     configs[0].readFloat(CONFIG_FTL, FTL_FILL_RATIO);
+    for (uint64_t lpn = 0; lpn < filled; lpn++)
+      for (int lane = 0; lane < lanes; lane++) model.insert(lpn * lanes + lane);
+    verify(baseline, p, model, "common-baseline", lanes);
+    verify(moving, p, model, "common-moving", lanes);
+    for (FAST *f : {&baseline, &moving}) {
+      CHECK(f->stat.fullMerge == 0 && f->stat.rwCompactions == 0 &&
+            f->stat.hostWritePages == 0, "warmup counters leaked into measurements");
+      uint64_t erases = 0;
+      for (auto &entry : f->blocks) erases += entry.second.getEraseCount();
+      for (auto &block : f->freeBlocks) erases += block.getEraseCount();
+      CHECK(erases > 0, "common warmup did not exercise GC");
+      for (auto &entry : f->rwMap)
+        CHECK(!entry.second.relocated, "compaction ran during common warmup");
+    }
+    if (!moving.rwMap.empty()) {
+      uint64_t before = moving.warmupStateHash();
+      auto &loc = moving.rwMap.begin()->second;
+      loc.relocated = true;
+      CHECK(before != moving.warmupStateHash(), "warmup fingerprint missed relocation state");
+      loc.relocated = false;
+    }
+  }
+  printf("Common Greedy warmup: 12 paired cases OK\n");
+}
+
+static void testGCWait(const char *path) {
+  ConfigReader conf;
+  conf.init(path);
+  Parameter p;
+  p.totalPhysicalBlocks = 60; p.totalLogicalBlocks = 30;
+  p.pagesInBlock = 8; p.ioUnitInPage = 4;
+  p.pageSize = 4096 * 4; p.pageCountToMaxPerf = 4;
+  FAST f(conf, p, nullptr, nullptr);
+  f.bSendToPAL = false;
+  f.batch.doneTick = 150;
+  f.recordGCWait(100, 0);
+  CHECK(f.stat.gcEvents[0] == 0, "warmup leaked into GC wait counters");
+  f.bSendToPAL = true;
+  f.recordGCWait(100, 0);
+  f.recordGCWait(120, 0);
+  f.recordGCWait(90, 1);
+  f.recordGCWait(150, 2);
+  CHECK(f.stat.gcEvents[0] == 2 && f.stat.gcWaitPs[0] == 80 &&
+        f.stat.gcMaxWaitPs[0] == 50, "SW GC wait accumulation incorrect");
+  CHECK(f.stat.gcEvents[1] == 1 && f.stat.gcWaitPs[1] == 60 &&
+        f.stat.gcEvents[2] == 1 && f.stat.gcWaitPs[2] == 0,
+        "GC wait paths/zero-duration events incorrect");
+  std::vector<Stats> names;
+  std::vector<double> values;
+  f.getStatList(names, "ftl."); f.getStatValues(values);
+  CHECK(names.size() == values.size(), "GC stat names/values misaligned");
+  for (size_t i = 0; i < names.size(); i++) {
+    if (names[i].name == "ftl.fast.gc.all.wait_ps")
+      CHECK(values[i] == 140, "total GC wait double counted or omitted a path");
+    if (names[i].name == "ftl.fast.gc.all.events")
+      CHECK(values[i] == 4, "total GC event count incorrect");
+  }
+  f.resetStatValues();
+  CHECK(f.stat.gcEvents[0] == 0 && f.stat.gcWaitPs[1] == 0 &&
+        f.stat.gcMaxWaitPs[0] == 0, "GC wait reset failed");
+  printf("GC wait: warmup exclusion, path totals, maximum and reset OK\n");
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     printf("사용법: %s <SimpleSSD 설정 파일>\n", argv[0]);
     return 2;
   }
 
+  testGCWait(argv[1]);
+  testCommonWarmup(argv[1]);
+  testCostVictim(argv[1]);
   testRWCompaction(argv[1]);
   if (failures) return 1;
 
@@ -347,7 +532,7 @@ int main(int argc, char **argv) {
   // 기존 FIFO/greedy와 버퍼 경로를 압축 OFF/ON 모두에서 검사한다.
   for (int compaction : {0, 1})
   for (int buffer : {0, 1})
-  for (int policy : {0, 1})
+  for (int policy : {0, 1, 2})
   for (int ioUnit : {4, 1}) {
     std::string cfg = makeTestConfig(argv[1], policy, buffer, compaction);
     ConfigReader conf;
@@ -367,7 +552,7 @@ int main(int argc, char **argv) {
     auto addModel = [&](uint64_t lpn, Bitset &flag) {
       for (uint32_t l = 0; l < p.ioUnitInPage; l++) if (flag.test(l)) model.insert(lpn * p.ioUnitInPage + l);
     };
-    for (int round = 0; round < 4000; round++) {
+    for (int round = 0; round < (policy == 2 ? 500 : 4000); round++) {
       int kind = rng() % 12;
       if (kind < 3) {
         // lane 단위 순차 쓰기: 페이지 순서로 lane을 하나씩 보낸다 (ICL이 보내는 패턴)

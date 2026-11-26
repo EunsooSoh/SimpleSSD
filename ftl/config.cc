@@ -42,6 +42,7 @@ const char NAME_FAST_RW_LOG_BLOCKS[] = "FASTRWLogBlocks";
 const char NAME_FAST_RW_GC_POLICY[] = "FASTRWGCPolicy";
 const char NAME_FAST_WRITE_BUFFER[] = "FASTWriteBuffer";
 const char NAME_FAST_RW_COMPACTION[] = "FASTRWCompaction";
+const char NAME_FAST_COMMON_WARMUP[] = "FASTCommonWarmup";
 
 Config::Config() {
   mapping = PAGE_MAPPING;
@@ -61,6 +62,7 @@ Config::Config() {
   fastRWGCPolicy = 0;
   fastWriteBuffer = 0;
   fastRWCompaction = 0;
+  fastCommonWarmup = 0;
 }
 
 bool Config::setConfig(const char *name, const char *value) {
@@ -117,6 +119,9 @@ bool Config::setConfig(const char *name, const char *value) {
   else if (MATCH_NAME(NAME_FAST_RW_COMPACTION)) {
     fastRWCompaction = strtoul(value, nullptr, 10);
   }
+  else if (MATCH_NAME(NAME_FAST_COMMON_WARMUP)) {
+    fastCommonWarmup = strtoul(value, nullptr, 10);
+  }
   else {
     ret = false;
   }
@@ -125,6 +130,9 @@ bool Config::setConfig(const char *name, const char *value) {
 }
 
 void Config::update() {
+  if (fastCommonWarmup > 1) {
+    panic("Invalid FASTCommonWarmup (expected 0 or 1)");
+  }
   if (fastRWCompaction > 1) {
     panic("Invalid FASTRWCompaction (expected 0 or 1)");
   }
@@ -190,6 +198,9 @@ uint64_t Config::readUint(uint32_t idx) {
       break;
     case FTL_FAST_RW_COMPACTION:
       ret = fastRWCompaction;
+      break;
+    case FTL_FAST_COMMON_WARMUP:
+      ret = fastCommonWarmup;
       break;
   }
 

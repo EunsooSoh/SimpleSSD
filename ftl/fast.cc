@@ -48,8 +48,8 @@ FAST::FAST(ConfigReader &c, Parameter &p, PAL::PAL *l, DRAM::AbstractDRAM *d)
 
   rwGCPolicy = conf.readUint(CONFIG_FTL, FTL_FAST_RW_GC_POLICY);
 
-  if (rwGCPolicy > 1) {
-    panic("ftl: FASTRWGCPolicy는 0(FIFO) 또는 1(greedy)이어야 합니다");
+  if (rwGCPolicy > 2) {
+    panic("ftl: FASTRWGCPolicy는 0(FIFO), 1(greedy), 2(cost/space)이어야 합니다");
   }
 
   rwChip = 0;
@@ -99,6 +99,14 @@ FAST::~FAST() {
 }
 
 bool FAST::initialize() {
+  const bool commonWarmup =
+      conf.readUint(CONFIG_FTL, FTL_FAST_COMMON_WARMUP) == 1;
+  const uint32_t runtimePolicy = rwGCPolicy;
+  const bool runtimeCompaction = useRWCompaction;
+  if (commonWarmup) {
+    rwGCPolicy = 1;
+    useRWCompaction = false;
+  }
   uint64_t nTotalLogicalPages;
   uint64_t nPagesToWarmup;
   uint64_t nPagesToInvalidate;
@@ -176,15 +184,89 @@ bool FAST::initialize() {
     }
   }
 
+  // 공통 초기화는 같은 데이터 배치와 로그 상태에서 출발하도록 한다.
+  // 버퍼/매핑/쓰기 포인터를 유지한 채 측정 구간의 정책만 복원한다.
+  rwGCPolicy = runtimePolicy;
+  useRWCompaction = runtimeCompaction;
   bSendToPAL = true;
 
   // 초기화 과정의 통계는 버린다
   resetStatValues();
 
+  if (commonWarmup) {
+    fprintf(stderr, "FAST_COMMON_WARMUP state=%016" PRIx64
+                    " free=%u rw=%zu buffered=%zu\n",
+            warmupStateHash(), nFreeBlocks, rwLogs.size(), wbuf.size());
+  }
+
   debugprint(LOG_FTL_FAST, "Mapped logical pages: %zu", mappedLanes.size());
   debugprint(LOG_FTL_FAST, "Initialization finished");
 
   return true;
+}
+
+// Canonical FNV-1a fingerprint: excludes runtime policy and reset counters.
+// Sort unordered-map keys; retain free/log/buffer order, which affects allocation.
+uint64_t FAST::warmupStateHash() {
+  uint64_t hash = UINT64_C(14695981039346656037);
+  auto mix = [&](uint64_t value) {
+    for (unsigned i = 0; i < 8; i++) {
+      hash ^= value & 0xff;
+      hash *= UINT64_C(1099511628211);
+      value >>= 8;
+    }
+  };
+  mix(param.totalPhysicalBlocks); mix(param.totalLogicalBlocks);
+  mix(param.pagesInBlock); mix(param.ioUnitInPage); mix(param.pageSize);
+  mix(param.pageCountToMaxPerf); mix(maxRWLogs); mix(useWriteBuffer);
+  mix(nFreeBlocks); mix(allocChip); mix(mappedSectors);
+  mix(sw.valid); mix(sw.pbn); mix(sw.lbn);
+  for (auto value : swNext) mix(value);
+  mix(rwLogs.size()); for (auto value : rwLogs) mix(value);
+  mix(nOpenSlots); mix(rwChip); mix(bufferedInReq);
+  for (auto value : openRW) mix((uint64_t)value);
+  mix(wbuf.size()); for (auto value : wbuf) mix(value);
+  mix(batch.beginTick); mix(batch.doneTick);
+  mix(batch.reads.size()); mix(batch.writes.size()); mix(batch.erases.size());
+  for (auto &block : freeBlocks) {
+    mix(block.getBlockIndex()); mix(block.getEraseCount());
+    mix(block.getLastAccessedTime());
+  }
+  std::vector<uint64_t> keys;
+  for (auto &entry : blocks) keys.push_back(entry.first);
+  std::sort(keys.begin(), keys.end());
+  mix(keys.size());
+  Bitset valid(param.ioUnitInPage);
+  std::vector<uint64_t> values;
+  for (auto key : keys) {
+    auto &block = blocks.at(key);
+    mix(key); mix(block.getEraseCount()); mix(block.getLastAccessedTime());
+    mix(block.getDirtyPageCount());
+    for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++)
+      mix(block.getNextWritePageIndex(lane));
+    for (uint32_t page = 0; page < param.pagesInBlock; page++) {
+      block.getPageInfo(page, values, valid);
+      for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
+        mix(valid.test(lane)); mix(values.at(lane));
+      }
+    }
+  }
+  keys.clear();
+  for (auto &entry : dataBlockMap) keys.push_back(entry.first);
+  std::sort(keys.begin(), keys.end()); mix(keys.size());
+  for (auto key : keys) { mix(key); mix(dataBlockMap.at(key)); }
+  keys.clear();
+  for (auto &entry : rwMap) keys.push_back(entry.first);
+  std::sort(keys.begin(), keys.end()); mix(keys.size());
+  for (auto key : keys) {
+    auto &loc = rwMap.at(key);
+    mix(key); mix(loc.pbn); mix(loc.page); mix(loc.lane); mix(loc.relocated);
+  }
+  keys.clear();
+  for (auto &entry : mappedLanes) keys.push_back(entry.first);
+  std::sort(keys.begin(), keys.end()); mix(keys.size());
+  for (auto key : keys) { mix(key); mix(mappedLanes.at(key)); }
+  return hash;
 }
 
 void FAST::read(Request &req, uint64_t &tick) {
@@ -692,11 +774,20 @@ void FAST::appendSW(uint64_t lpn, uint32_t lane) {
 //  - switch : 모든 lane이 가득 차고 모두 유효하면 SW 블록이 그대로 데이터 블록이 된다
 //  - partial: SW에 쓴 부분이 모두 유효하면 남은 칸만 데이터 블록에서 복사한다
 //  - full   : 그 외에는 새 블록에 모아서 합친다
+void FAST::recordGCWait(uint64_t begin, uint32_t path) {
+  if (!bSendToPAL) return;
+  const uint64_t elapsed = batch.doneTick - begin;
+  stat.gcEvents[path]++;
+  stat.gcWaitPs[path] += elapsed;
+  stat.gcMaxWaitPs[path] = MAX(stat.gcMaxWaitPs[path], elapsed);
+}
+
 void FAST::mergeSW() {
   if (!sw.valid) {
     return;
   }
 
+  const uint64_t gcBegin = batch.doneTick;
   uint64_t lbn = sw.lbn;
   bool prefixValid = true;
   bool allFull = true;
@@ -761,6 +852,7 @@ void FAST::mergeSW() {
   }
 
   flushBatch();
+  recordGCWait(gcBegin, 0);
 }
 
 // 논리 블록 하나의 모든 최신 sector를 새 데이터 블록으로 모은다 (full merge).
@@ -813,16 +905,111 @@ void FAST::mergeLbn(uint64_t lbn) {
   stat.fullMerge++;
 }
 
+// Positive-denominator rational comparison without overflowing cross-products.
+// No reclaimable space ranks last; exact ties retain the older log/method.
+bool FAST::lowerRWCost(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+  if (b == 0) return false;
+  if (d == 0) return true;
+  bool reverse = false;
+  for (;;) {
+    if (a / b != c / d)
+      return reverse ? a / b > c / d : a / b < c / d;
+    a %= b;
+    c %= d;
+    if (a == 0 || c == 0) return reverse ? a > c : a < c;
+    std::swap(a, b);
+    std::swap(c, d);
+    reverse = !reverse;
+  }
+}
+
+// Read-only plan for one RW log. Full merge counts latest NAND sectors of every
+// affected LBN, not just sectors inside the victim. Buffer-only versions excluded.
+FAST::RWReclaimCost FAST::estimateRWCost(
+    uint32_t pbn, uint32_t requiredLane,
+    std::unordered_map<uint64_t, uint64_t> *mergeCostCache) {
+  RWReclaimCost cost = {};
+  std::vector<uint64_t> lbns;
+  std::vector<uint32_t> validPerLane(param.ioUnitInPage, 0);
+  bool alreadyRelocated = false;
+  Bitset valid(param.ioUnitInPage);
+  std::vector<uint64_t> values;
+  for (uint32_t page = 0; page < param.pagesInBlock; page++) {
+    if (!blocks.at(pbn).getPageInfo(page, values, valid)) continue;
+    for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
+      if (!valid.test(lane)) continue;
+      uint64_t key = values.at(lane);
+      auto loc = rwMap.find(key);
+      if (loc == rwMap.end() || loc->second.pbn != pbn ||
+          loc->second.page != page || loc->second.lane != lane)
+        panic("ftl: RW cost source mapping mismatch");
+      cost.validSectors++;
+      validPerLane.at(key % param.ioUnitInPage)++;
+      alreadyRelocated |= loc->second.relocated;
+      lbns.push_back(key / param.ioUnitInPage / param.pagesInBlock);
+    }
+  }
+  uint64_t occupiedByValid = cost.validSectors;
+  if (!useWriteBuffer && requiredLane < param.ioUnitInPage) {
+    cost.fullSpace = blocks.at(pbn).getNextWritePageIndex(requiredLane);
+    occupiedByValid = validPerLane.at(requiredLane);
+  }
+  else {
+    for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++)
+      cost.fullSpace += blocks.at(pbn).getNextWritePageIndex(lane);
+  }
+  if (occupiedByValid > cost.fullSpace)
+    panic("ftl: RW valid space exceeds written space");
+  cost.compactSpace = cost.fullSpace - occupiedByValid;
+  std::sort(lbns.begin(), lbns.end());
+  lbns.erase(std::unique(lbns.begin(), lbns.end()), lbns.end());
+  for (auto lbn : lbns) {
+    uint64_t copies = 0;
+    bool cached = false;
+    if (mergeCostCache) {
+      auto found = mergeCostCache->find(lbn);
+      if (found != mergeCostCache->end()) {
+        copies = found->second;
+        cached = true;
+      }
+    }
+    if (!cached) {
+      for (uint32_t page = 0; page < param.pagesInBlock; page++) {
+        uint64_t lpn = lbn * param.pagesInBlock + page;
+        for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
+          uint32_t block, offset, physicalLane;
+          if (findLatest(lpn, lane, block, offset, physicalLane)) copies++;
+        }
+      }
+      if (mergeCostCache) (*mergeCostCache)[lbn] = copies;
+    }
+    cost.mergeCopies += copies;
+  }
+  // fullSpace counts previously used slots; moving consumes slots at destination.
+  // An empty victim goes directly to erase; no scratch block needed.
+  cost.compact = useRWCompaction && cost.validSectors > 0 &&
+                 !alreadyRelocated && cost.compactSpace > 0 &&
+                 (useWriteBuffer || requiredLane >= param.ioUnitInPage ||
+                  occupiedByValid < param.pagesInBlock) &&
+                 lowerRWCost(cost.validSectors, cost.compactSpace,
+                             cost.mergeCopies, cost.fullSpace);
+  return cost;
+}
+
 // RW 로그 중 비울 victim을 정책에 따라 고른다. SW 로그는 블록이 1개뿐이라
 // 고를 대상이 없으므로 이 정책은 RW 로그에만 적용된다.
 //  - 0 (FIFO): 가장 오래된 블록
 //  - 1 (greedy): 유효 sector가 가장 적은 블록. 같으면 더 오래된 블록을 고른다.
 //    유효 sector가 적을수록 merge로 옮길 sector가 적을 것이라는 기준이다.
+//  - 2 (cost/space): 각 로그의 가능한 처리 방법 중 최저 복사량/회수 공간.
+//    후보 전체를 비교하고 동률이면 오래된 로그, 방법 동률이면 full merge.
 // 쓰기 버퍼를 쓰면 지금 채우고 있는(열린) RW 로그는 후보에서 뺀다. 그래서 victim은
 // 모든 채널이 다 찬 RW 로그 중에서만 고른다.
-std::list<uint32_t>::iterator FAST::selectRWVictim() {
+std::list<uint32_t>::iterator FAST::selectRWVictim(uint32_t requiredLane) {
   auto best = rwLogs.end();
   uint32_t bestValid = 0;
+  RWReclaimCost bestCost = {};
+  std::unordered_map<uint64_t, uint64_t> mergeCostCache;
 
   for (auto iter = rwLogs.begin(); iter != rwLogs.end(); ++iter) {
     if (isOpenRW(*iter)) {
@@ -831,6 +1018,16 @@ std::list<uint32_t>::iterator FAST::selectRWVictim() {
 
     if (rwGCPolicy == 0) {
       return iter;
+    }
+
+    if (rwGCPolicy == 2) {
+      auto cost = estimateRWCost(*iter, requiredLane, &mergeCostCache);
+      if (best == rwLogs.end() ||
+          lowerRWCost(cost.copies(), cost.space(), bestCost.copies(), bestCost.space())) {
+        best = iter;
+        bestCost = cost;
+      }
+      continue;
     }
 
     uint32_t valid = blocks.at(*iter).getValidPageCountRaw();
@@ -847,7 +1044,7 @@ std::list<uint32_t>::iterator FAST::selectRWVictim() {
 #ifdef FAST_VERIFY_VICTIM
 // 정책이 고른 victim이 정책 정의와 맞는지 검사한다 (빌드 옵션 -DFAST_VERIFY_VICTIM).
 // 블록의 유효 sector 수는 Block이 아니라 rwMap에서 따로 세어 대조한다.
-void FAST::verifyRWVictim(std::list<uint32_t>::iterator sel) {
+void FAST::verifyRWVictim(std::list<uint32_t>::iterator sel, uint32_t requiredLane) {
   std::unordered_map<uint32_t, uint32_t> validByMap;
 
   for (auto &e : rwMap) {
@@ -863,9 +1060,21 @@ void FAST::verifyRWVictim(std::list<uint32_t>::iterator sel) {
 
   // 열린 RW 로그를 뺀 블록 중에서 정책 정의대로 고른 결과를 따로 구한다
   auto expect = rwLogs.end();
+  RWReclaimCost bestCost = {};
+  std::unordered_map<uint64_t, uint64_t> mergeCostCache;
 
   for (auto iter = rwLogs.begin(); iter != rwLogs.end(); ++iter) {
     if (isOpenRW(*iter)) {
+      continue;
+    }
+
+    if (rwGCPolicy == 2) {
+      auto cost = estimateRWCost(*iter, requiredLane, &mergeCostCache);
+      if (expect == rwLogs.end() ||
+          lowerRWCost(cost.copies(), cost.space(), bestCost.copies(), bestCost.space())) {
+        expect = iter;
+        bestCost = cost;
+      }
       continue;
     }
 
@@ -898,12 +1107,9 @@ void FAST::verifyRWVictim(std::list<uint32_t>::iterator sel) {
 bool FAST::tryCompactRW(std::list<uint32_t>::iterator victimIter,
                         uint32_t requiredLane, uint32_t &replacement) {
   const uint32_t victim = *victimIter;
+  if (!estimateRWCost(victim, requiredLane).compact) return false;
   std::vector<uint64_t> keys;
   std::vector<SectorLoc> sources;
-  std::vector<uint64_t> lbns;
-  std::vector<uint32_t> validPerLane(param.ioUnitInPage, 0);
-  uint64_t written = 0;
-  uint64_t valid = 0;
 
   // 원본의 물리 순서로 모아 복사 순서와 결과가 실행마다 같게 한다.
   Bitset bit(param.ioUnitInPage);
@@ -922,56 +1128,9 @@ bool FAST::tryCompactRW(std::list<uint32_t>::iterator victimIter,
           loc->second.page != page || loc->second.lane != lane) {
         panic("ftl: RW compaction source mapping mismatch");
       }
-      // 같은 최신 버전을 반복 이동시키는 대신 full merge 한다.
-      if (loc->second.relocated) {
-        return false;
-      }
       keys.push_back(key);
       sources.push_back(loc->second);
-      validPerLane.at(key % param.ioUnitInPage)++;
-      lbns.push_back(key / param.ioUnitInPage / param.pagesInBlock);
     }
-  }
-
-  if (keys.empty()) {
-    return false;  // 빈 로그는 scratch 없이 기존 경로에서 erase 한다.
-  }
-  if (!useWriteBuffer && requiredLane < param.ioUnitInPage) {
-    written = blocks.at(victim).getNextWritePageIndex(requiredLane);
-    valid = validPerLane.at(requiredLane);
-    if (valid >= param.pagesInBlock) {
-      return false;  // 지금 요청한 lane에 실제 쓰기 공간이 생겨야 한다.
-    }
-  }
-  else {
-    for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
-      written += blocks.at(victim).getNextWritePageIndex(lane);
-    }
-    valid = keys.size();
-  }
-  if (written <= valid) {
-    return false;
-  }
-
-  std::sort(lbns.begin(), lbns.end());
-  lbns.erase(std::unique(lbns.begin(), lbns.end()), lbns.end());
-  uint64_t mergeCopies = 0;
-  for (auto lbn : lbns) {
-    for (uint32_t page = 0; page < param.pagesInBlock; page++) {
-      uint64_t lpn = lbn * param.pagesInBlock + page;
-      for (uint32_t lane = 0; lane < param.ioUnitInPage; lane++) {
-        uint32_t pbn, offset, physLane;
-        // DRAM 버퍼에만 있는 최신 버전은 full merge도 복사하지 않는다.
-        if (findLatest(lpn, lane, pbn, offset, physLane)) {
-          mergeCopies++;
-        }
-      }
-    }
-  }
-  // 복사량/회수 공간이 full merge보다 작을 때만 압축한다.
-  // OFF 모드는 현재 요청한 lane, ON 모드는 전체 lane의 공간을 비교한다.
-  if ((uint64_t)keys.size() * written >= mergeCopies * (written - valid)) {
-    return false;
   }
 
   // 같은 호스트 요청 앞부분에서 발생한 NAND 쓰기부터 완료시킨다.
@@ -1010,15 +1169,27 @@ bool FAST::tryCompactRW(std::list<uint32_t>::iterator victimIter,
 // victim에 유효 sector를 가진 모든 논리 블록을 각각 full merge 한다.
 // 여러 논리 블록의 merge 요청을 하나의 batch로 모아 채널/chip 병렬성을 쓴다.
 int64_t FAST::mergeRWVictim(uint32_t requiredLane) {
-  auto victimIter = selectRWVictim();
+  const uint64_t gcBegin = batch.doneTick;
+  auto victimIter = selectRWVictim(requiredLane);
 #ifdef FAST_VERIFY_VICTIM
-  verifyRWVictim(victimIter);
+  verifyRWVictim(victimIter, requiredLane);
 #endif
   if (victimIter == rwLogs.end()) {
     panic("ftl: RW 로그 victim 후보가 없습니다");
   }
 
   uint32_t victim = *victimIter;
+  if (rwGCPolicy == 2) {
+    auto greedy = rwLogs.end();
+    for (auto it = rwLogs.begin(); it != rwLogs.end(); ++it) {
+      if (isOpenRW(*it)) continue;
+      if (greedy == rwLogs.end() || blocks.at(*it).getValidPageCountRaw() <
+                                   blocks.at(*greedy).getValidPageCountRaw())
+        greedy = it;
+    }
+    stat.rwCostSelections++;
+    if (greedy != victimIter) stat.rwCostDifferentFromGreedy++;
+  }
   if (useRWCompaction) {
     uint32_t replacement;
     if (tryCompactRW(victimIter, requiredLane, replacement)) {
@@ -1028,6 +1199,7 @@ int64_t FAST::mergeRWVictim(uint32_t requiredLane) {
             applyLatency(CPU::FTL__PAGE_MAPPING, CPU::DO_GARBAGE_COLLECTION);
         batch.beginTick = batch.doneTick;
       }
+      recordGCWait(gcBegin, 2);
       return replacement;
     }
     if (blocks.at(victim).getValidPageCountRaw() > 0) {
@@ -1074,6 +1246,7 @@ int64_t FAST::mergeRWVictim(uint32_t requiredLane) {
   }
 
   flushBatch();
+  recordGCWait(gcBegin, 1);
   return -1;
 }
 
@@ -1646,6 +1819,26 @@ void FAST::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.name = prefix + "fast.rw.compaction_fallbacks";
   temp.desc = "Nonempty RW victims using full merge instead of compaction";
   list.push_back(temp);
+
+  temp.name = prefix + "fast.rw.cost_selections";
+  temp.desc = "RW victims selected by copy cost per reclaimed space";
+  list.push_back(temp);
+  temp.name = prefix + "fast.rw.cost_different_from_greedy";
+  temp.desc = "Cost-selected victims differing from local greedy selection";
+  list.push_back(temp);
+
+  for (const auto &path : {"all", "sw", "rw_merge", "rw_compaction"}) {
+    const std::string name = prefix + "fast.gc." + path;
+    temp.name = name + ".events";
+    temp.desc = "Measured synchronous reclaim calls (excluding warmup)";
+    list.push_back(temp);
+    temp.name = name + ".wait_ps";
+    temp.desc = "Reclaim-call elapsed simulated ps, including pending NAND waits";
+    list.push_back(temp);
+    temp.name = name + ".max_wait_ps";
+    temp.desc = "Maximum single reclaim-call elapsed simulated ps";
+    list.push_back(temp);
+  }
 }
 
 void FAST::getStatValues(std::vector<double> &values) {
@@ -1684,6 +1877,17 @@ void FAST::getStatValues(std::vector<double> &values) {
   values.push_back(stat.rwCompactions);
   values.push_back(stat.rwCompactionCopies);
   values.push_back(stat.rwCompactionFallbacks);
+  values.push_back(stat.rwCostSelections);
+  values.push_back(stat.rwCostDifferentFromGreedy);
+  values.push_back(stat.gcEvents[0] + stat.gcEvents[1] + stat.gcEvents[2]);
+  values.push_back(stat.gcWaitPs[0] + stat.gcWaitPs[1] + stat.gcWaitPs[2]);
+  values.push_back(MAX(stat.gcMaxWaitPs[0],
+                       MAX(stat.gcMaxWaitPs[1], stat.gcMaxWaitPs[2])));
+  for (uint32_t path = 0; path < 3; path++) {
+    values.push_back(stat.gcEvents[path]);
+    values.push_back(stat.gcWaitPs[path]);
+    values.push_back(stat.gcMaxWaitPs[path]);
+  }
 }
 
 void FAST::resetStatValues() {
